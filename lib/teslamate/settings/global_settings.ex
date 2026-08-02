@@ -15,6 +15,10 @@ defmodule TeslaMate.Settings.GlobalSettings do
     field :language, :string
     field :theme_mode, Ecto.Enum, values: [:light, :system, :dark], default: :system
 
+    field :suc_cost_basis, Ecto.Enum, values: [:gross, :net], default: :gross
+    field :suc_sync_interval_hours, :integer, default: 24
+    field :suc_giveup_window_days, :integer, default: 14
+
     timestamps()
   end
 
@@ -93,7 +97,10 @@ defmodule TeslaMate.Settings.GlobalSettings do
       :base_url,
       :grafana_url,
       :language,
-      :theme_mode
+      :theme_mode,
+      :suc_cost_basis,
+      :suc_sync_interval_hours,
+      :suc_giveup_window_days
     ])
     |> validate_required([
       :unit_of_length,
@@ -110,6 +117,8 @@ defmodule TeslaMate.Settings.GlobalSettings do
     |> validate_inclusion(:language, Map.values(@supported_languages),
       message: "is not supported"
     )
+    |> validate_number(:suc_sync_interval_hours, greater_than: 0)
+    |> validate_number(:suc_giveup_window_days, greater_than: 0)
   end
 
   defp trim_url(url) do

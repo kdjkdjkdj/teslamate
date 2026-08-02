@@ -364,6 +364,55 @@
       </div>
     </div>
   </div>
+  <div class="columns is-mobile is-centered">
+    <div class="column">
+      <h2 class="title is-4"><%= gettext("Supercharger Costs") %></h2>
+      <div class="field is-horizontal">
+        <div class="field-label is-normal">
+          <%= label(f, :suc_cost_basis, gettext("Cost Basis"), class: "label") %>
+        </div>
+        <div class="field-body">
+          <div class="field">
+            <div class="control">
+              <div class="select is-fullwidth">
+                <%= select(f, :suc_cost_basis, [
+                  {gettext("Gross"), :gross},
+                  {gettext("Net"), :net}
+                ]) %>
+              </div>
+            </div>
+            <p class="help is-danger"><%= error_tag(f, :suc_cost_basis) %></p>
+          </div>
+        </div>
+      </div>
+      <div class="field is-horizontal">
+        <div class="field-label is-normal">
+          <%= label(f, :suc_sync_interval_hours, gettext("Sync Interval (hours)"), class: "label") %>
+        </div>
+        <div class="field-body">
+          <div class="field">
+            <div class="control">
+              <%= number_input(f, :suc_sync_interval_hours, min: 1, class: "input", phx_debounce: "blur") %>
+            </div>
+            <p class="help is-danger"><%= error_tag(f, :suc_sync_interval_hours) %></p>
+          </div>
+        </div>
+      </div>
+      <div class="field is-horizontal">
+        <div class="field-label is-normal">
+          <%= label(f, :suc_giveup_window_days, gettext("Give-up Window (days)"), class: "label") %>
+        </div>
+        <div class="field-body">
+          <div class="field">
+            <div class="control">
+              <%= number_input(f, :suc_giveup_window_days, min: 1, class: "input", phx_debounce: "blur") %>
+            </div>
+            <p class="help is-danger"><%= error_tag(f, :suc_giveup_window_days) %></p>
+          </div>
+        </div>
+      </div>
+    </div>
+  </div>
 </.form>
 
 <div class="columns is-mobile is-centered">

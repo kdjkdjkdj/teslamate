@@ -1,0 +1,147 @@
+defmodule TeslaMate.FleetTelemetry.StreamProviderTest do
+  use ExUnit.Case, async: true
+  alias TeslaMate.FleetTelemetry.StreamProvider
+  alias TeslaApi.Stream.Data, as: StreamData
+
+  defp start(opts) do
+    test_pid = self()
+    receiver = fn sd -> send(test_pid, {:stream, sd}) end
+
+    {:ok, pid} =
+      StreamProvider.start_link(
+        Keyword.merge([car_id: 1, vin: "VINTEST", receiver: receiver, connect?: false], opts)
+      )
+
+    pid
+  end
+
+  test "emittiert %Stream.Data{} erst beim Location-Trigger" do
+    pid = start([])
+    StreamProvider.ingest(pid, "VehicleSpeed", 42.0)
+    StreamProvider.ingest(pid, "Gear", "ShiftStateD")
+    refute_receive {:stream, _}, 50
+
+    StreamProvider.ingest(pid, "Location", %{"latitude" => 48.39, "longitude" => 10.86})
+    assert_receive {:stream, %StreamData{} = sd}, 200
+    assert sd.shift_state == "D"
+    assert sd.speed == 42.0
+    assert sd.est_lat == 48.39
+  end
+
+  test "sendet das :fleet_streaming Freshness-Signal nach den Stream-Daten" do
+    pid = start([])
+    StreamProvider.ingest(pid, "Location", %{"latitude" => 1.0, "longitude" => 2.0})
+    # Reihenfolge: erst die Stream-Daten, dann der Freshness-Ping
+    assert_receive {:stream, %StreamData{}}, 200
+    assert_receive {:stream, :fleet_streaming}, 200
+  end
+
+  test "Stall beendet den Prozess NICHT - bleibt subscribed und nimmt den Feed wieder auf" do
+    pid = start(stall_ms: 60)
+    ref = Process.monitor(pid)
+
+    StreamProvider.ingest(pid, "Location", %{"latitude" => 1.0, "longitude" => 2.0})
+    assert_receive {:stream, %StreamData{}}, 200
+    assert_receive {:stream, :fleet_streaming}, 200
+
+    # > stall_ms ohne Daten: Prozess lebt weiter, kein Fallback-durch-Tod mehr
+    refute_receive {:DOWN, ^ref, :process, ^pid, _}, 200
+    assert Process.alive?(pid)
+
+    # Daten kehren zurueck -> Live-Feed wird automatisch wieder aufgenommen
+    StreamProvider.ingest(pid, "Location", %{"latitude" => 3.0, "longitude" => 4.0})
+    assert_receive {:stream, %StreamData{est_lat: 3.0}}, 200
+    assert_receive {:stream, :fleet_streaming}, 200
+  end
+
+  test "stop/1 ist idempotent auch bei totem Pid" do
+    pid = start([])
+    assert StreamProvider.stop(pid) == :ok
+    assert StreamProvider.stop(pid) == :ok
+  end
+
+  test "stop/1 raeumt ohne Connection sauber auf (terminate ohne client_id)" do
+    pid = start([])
+    ref = Process.monitor(pid)
+    assert StreamProvider.stop(pid) == :ok
+    assert_receive {:DOWN, ^ref, :process, ^pid, :normal}, 200
+  end
+
+  describe "Reconnect-Robustheit (Crash-Loop-Fix)" do
+    test "init ueberlebt {:already_started} vom Connect und reisst den FSM nicht mit" do
+      cf = fn _client_id -> {:error, {:already_started, self()}} end
+      pid = start(connect?: true, connect_fun: cf)
+
+      assert Process.alive?(pid)
+
+      # Feed funktioniert trotzdem (ingest ist broker-unabhaengig)
+      StreamProvider.ingest(pid, "Location", %{"latitude" => 1.0, "longitude" => 2.0})
+      assert_receive {:stream, %StreamData{est_lat: 1.0}}, 200
+    end
+
+    test "init ueberlebt einen Connect-Fehler und laeuft degraded weiter" do
+      cf = fn _client_id -> {:error, :econnrefused} end
+      pid = start(connect?: true, connect_fun: cf)
+
+      assert Process.alive?(pid)
+      ref = Process.monitor(pid)
+      refute_receive {:DOWN, ^ref, :process, ^pid, _}, 100
+    end
+
+    test "jede Instanz verwendet eine eindeutige client_id" do
+      test_pid = self()
+      cf = fn client_id -> send(test_pid, {:cid, client_id}); {:ok, self()} end
+
+      start(connect?: true, connect_fun: cf)
+      start(connect?: true, connect_fun: cf)
+
+      assert_receive {:cid, id1}, 200
+      assert_receive {:cid, id2}, 200
+      assert id1 != id2
+      assert String.starts_with?(id1, "TESLAMATE_FLEETSTREAM_VINTEST_")
+      assert String.starts_with?(id2, "TESLAMATE_FLEETSTREAM_VINTEST_")
+    end
+  end
+
+  describe "map_fun (Charge-Feed-Reuse)" do
+    test "map_fun wird fuer das emittierte Objekt genutzt" do
+      me = self()
+
+      {:ok, pid} =
+        StreamProvider.start_link(
+          car_id: 1,
+          vin: "V",
+          connect?: false,
+          receiver: fn x -> send(me, {:got, x}) end,
+          trigger_field: "DetailedChargeState",
+          map_fun: fn fields, _now -> {:charge, Map.get(fields, "DetailedChargeState")} end
+        )
+
+      StreamProvider.ingest(pid, "DetailedChargeState", "DetailedChargeStateCharging")
+      assert_receive {:got, {:charge, "DetailedChargeStateCharging"}}, 200
+      assert_receive {:got, :fleet_streaming}, 200
+    end
+
+    test "ohne map_fun bleibt der Default to_stream_data (Fahr-Feed unveraendert)" do
+      me = self()
+
+      {:ok, pid} =
+        StreamProvider.start_link(
+          car_id: 1,
+          vin: "V",
+          connect?: false,
+          receiver: fn x -> send(me, {:got, x}) end
+        )
+
+      StreamProvider.ingest(pid, "Location", %{"latitude" => 1.0, "longitude" => 2.0})
+      assert_receive {:got, %StreamData{est_lat: 1.0}}, 200
+      assert_receive {:got, :fleet_streaming}, 200
+    end
+  end
+
+  describe "fleet_driving_interval" do
+    test "default 180s" do
+      assert TeslaMate.Vehicles.Vehicle.fleet_driving_interval() == 180
+    end
+  end
+end

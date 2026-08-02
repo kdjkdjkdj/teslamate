@@ -11,6 +11,7 @@ defmodule TeslaMate.Vehicles.Vehicle do
 
   alias TeslaApi.Vehicle.State.{Climate, VehicleState, Drive, Charge, VehicleConfig}
   alias TeslaApi.{Stream, Vehicle}
+  alias TeslaMate.FleetTelemetry.{ChargeStream, Mapper, StreamProvider}
 
   import Core.Dependency, only: [call: 3, call: 2]
 
@@ -25,6 +26,16 @@ defmodule TeslaMate.Vehicles.Vehicle do
               task: nil,
               import?: false,
               stream_pid: nil,
+              # last_stream_at: timestamp of the most recent Fleet-telemetry data point. Used to
+              # decide whether the live feed is currently fresh (fleet_stream_active?). Lets the
+              # FSM throttle polling to the fleet interval while data flows and fall back to
+              # normal polling when the feed goes quiet - without the StreamProvider having to die.
+              last_stream_at: nil,
+              # charge_stream_pid / last_charge_stream_at mirror stream_pid / last_stream_at, but for
+              # the separate charge feed that lives only during {:charging, _}. It densifies the charge
+              # curve (insert_charge) from the feed and throttles the charge poll (charge_fleet_active?).
+              charge_stream_pid: nil,
+              last_charge_stream_at: nil,
               # pre_online_check tracks whether an apparent online event is a real wakeup or a brief
               # subsystem check. Some vehicles (especially MCU2-upgraded cars) wake briefly (~2-3 min)
               # each hour for subsystem checks and report online, but requesting vehicle_data causes a
@@ -43,6 +54,10 @@ defmodule TeslaMate.Vehicles.Vehicle do
 
   @drive_timeout_min 15
 
+  # Fleet feed is considered "active" only if a telemetry point arrived within this window.
+  # Fleet pushes Location roughly every ~10s, so 30s tolerates a couple of missed points
+  # before the FSM falls back from the fleet interval to normal polling.
+  @fleet_stale_ms 30_000
   @vin_model_years %{
     "A" => 2010,
     "B" => 2011,
@@ -91,6 +106,7 @@ defmodule TeslaMate.Vehicles.Vehicle do
   def online_interval, do: interval("POLLING_ONLINE_INTERVAL", 60)
   def charging_interval, do: interval("POLLING_CHARGING_INTERVAL", 5)
   def minimum_interval, do: interval("POLLING_MINIMUM_INTERVAL", 0)
+  def fleet_driving_interval, do: interval("POLLING_FLEET_DRIVING_INTERVAL", 180)
 
   def identify(%Vehicle{display_name: name, vin: vin, vehicle_config: config}) do
     case config do
@@ -836,8 +852,79 @@ defmodule TeslaMate.Vehicles.Vehicle do
     {:keep_state_and_data, schedule_fetch(0, data)}
   end
 
+  def handle_event(:info, {:stream, :fleet_streaming}, _state, %Data{} = data) do
+    # Freshness-Ping vom Fleet-StreamProvider: markiert den Live-Feed als aktuell.
+    {:keep_state, %Data{data | last_stream_at: DateTime.utc_now()}}
+  end
+
   def handle_event(:info, {:stream, stream_data}, _state, data) do
     Logger.info("Received stream data: #{inspect(stream_data)}", car_id: data.car.id)
+    :keep_state_and_data
+  end
+
+  #### Charge feed (opt-in, FLEET_TELEMETRY_FEED_CHARGING)
+
+  # Live-Verdichtung + feed-getriebenes Ende, waehrend {:charging, cproc}. Ein %ChargeStream{}
+  # wird per merge_charge in das letzte Poll-%Vehicle{} gemischt -> bestehendes insert_charge.
+  def handle_event(:info, {:stream_charge, %ChargeStream{} = cs}, {:charging, cproc}, %Data{} = data) do
+    case Mapper.charge_phase(cs.charging_state) do
+      phase when phase in ["starting", "charging"] ->
+        vehicle = merge_charge(data.last_response, cs, time: true)
+        :ok = insert_charge(cproc, vehicle, data)
+
+        data = %Data{data | last_response: vehicle, last_charge_stream_at: DateTime.utc_now()}
+        power = vehicle.charge_state.charger_power
+
+        {:keep_state, data,
+         [broadcast_summary(), schedule_fetch(charge_poll_interval(data, power), data)]}
+
+      phase when phase in ["stopped", "complete"] ->
+        vehicle = merge_charge(data.last_response, cs, time: true)
+
+        {:ok, _} =
+          Repo.transaction(fn ->
+            :ok = insert_charge(cproc, vehicle, data)
+
+            {:ok, %Log.ChargingProcess{duration_min: duration, charge_energy_added: added}} =
+              call(data.deps.log, :complete_charging_process, [cproc])
+
+            Logger.info(
+              "Charging / #{cs.charging_state} / #{added} kWh – #{duration} min (feed)",
+              car_id: data.car.id
+            )
+          end)
+
+        :ok = disconnect_charge_stream(data)
+
+        {:next_state, :start, %Data{data | last_response: vehicle, charge_stream_pid: nil},
+         [broadcast_summary(), schedule_fetch(0, data)]}
+
+      _ ->
+        # Idle/Disconnected/unbekannt: nur Freshness, kein Kurvenpunkt.
+        {:keep_state, %Data{data | last_charge_stream_at: DateTime.utc_now()}}
+    end
+  end
+
+  # Start-Beschleunigung: erkennt der Charge-Feed im :online-State bereits eine Ladung, wird ein
+  # Poll forciert (der bestehende :online-Handler startet den charging_process mit Position aus dem
+  # Poll). Absicherung - der Lade-Start bleibt bewusst poll-getrieben (Design).
+  def handle_event(:info, {:stream_charge, %ChargeStream{} = cs}, :online, %Data{} = data) do
+    if Mapper.charge_phase(cs.charging_state) in ["starting", "charging"] do
+      Logger.info("Online / Charging detected (feed)", car_id: data.car.id)
+      {:keep_state_and_data, schedule_fetch(0, data)}
+    else
+      :keep_state_and_data
+    end
+  end
+
+  # Freshness-Ping des ChargeStreamProviders (analog {:stream, :fleet_streaming}).
+  def handle_event(:info, {:stream_charge, :fleet_streaming}, _state, %Data{} = data) do
+    {:keep_state, %Data{data | last_charge_stream_at: DateTime.utc_now()}}
+  end
+
+  # Charge-Snapshot ausserhalb von {:charging} (z.B. Rest-Snapshot nach Ende): ignorieren.
+  # Der Lade-START bleibt bewusst poll-getrieben (Design); Task 7 ergaenzt die Start-Beschleunigung.
+  def handle_event(:info, {:stream_charge, _payload}, _state, _data) do
     :keep_state_and_data
   end
 
@@ -1010,6 +1097,11 @@ defmodule TeslaMate.Vehicles.Vehicle do
   def handle_event(:internal, {:update, {:online, vehicle}} = evt, :start, %Data{} = data) do
     Logger.info("Start / :online", car_id: data.car.id)
 
+    # Auto kommt (evtl. aus offline/asleep) online -> pruefen, ob im Sleep eine
+    # Ladung verpasst wurde und aus den Fleet-Shadow-Daten nachtragen. No-op ohne
+    # aktiven FLEET_TELEMETRY_CHARGE_BACKFILL-Flag; idempotent (Marker + Overlap).
+    TeslaMate.FleetTelemetry.ChargeBackfill.trigger(data.car.id)
+
     {:ok, attrs} = identify(vehicle)
 
     opts =
@@ -1133,13 +1225,17 @@ defmodule TeslaMate.Vehicles.Vehicle do
         |> Logger.info(car_id: data.car.id)
 
         :ok = disconnect_stream(data)
+        # Fahr-Stream aus, Charge-Feed an: der eigene Provider verdichtet die Ladekurve waehrend
+        # {:charging} und drosselt den Poll. No-op (nil) ohne aktives FLEET_TELEMETRY_FEED_CHARGING.
+        charge_stream_pid = charge_connect_stream(data)
 
         {:next_state, {:charging, cproc},
          %Data{
            data
            | last_state_change: DateTime.utc_now(),
              last_used: DateTime.utc_now(),
-             stream_pid: nil
+             stream_pid: nil,
+             charge_stream_pid: charge_stream_pid
          }, [broadcast_summary(), schedule_fetch(5, data), schedule_position_storing()]}
 
       _ ->
@@ -1162,13 +1258,15 @@ defmodule TeslaMate.Vehicles.Vehicle do
     {:keep_state_and_data, schedule_fetch(data)}
   end
 
-  def handle_event(:internal, {:update, {:asleep, _vehicle}} = event, {:charging, cproc}, data) do
+  def handle_event(:internal, {:update, {:asleep, _vehicle}} = event, {:charging, cproc}, %Data{} = data) do
     Logger.warning("Vehicle went asleep while charging (?)", car_id: data.car.id)
 
     {:ok, _} = call(data.deps.log, :complete_charging_process, [cproc])
     Logger.info("Charging / Aborted", car_id: data.car.id)
 
-    {:next_state, :start, data, {:next_event, :internal, event}}
+    :ok = disconnect_charge_stream(data)
+
+    {:next_state, :start, %Data{data | charge_stream_pid: nil}, {:next_event, :internal, event}}
   end
 
   def handle_event(:internal, {:update, {:online, vehicle}}, {:charging, cproc}, %Data{} = data) do
@@ -1179,10 +1277,13 @@ defmodule TeslaMate.Vehicles.Vehicle do
       when charging_state in ["Starting", "Charging"] ->
         :ok = insert_charge(cproc, vehicle, data)
 
-        interval =
-          vehicle.charge_state
-          |> Map.get(:charger_power)
-          |> determince_interval()
+        # Feed-Seed: die zuletzt gepollte Phase in den ChargeStreamProvider zuruecklegen, damit
+        # die Stopped-Kante nicht verpasst wird (onChange-Race). No-op ohne aktiven Charge-Feed.
+        seed_fleet_charge_state(data, charging_state)
+
+        # Bei frischem Charge-Feed auf POLLING_FLEET_CHARGING_INTERVAL (300 s) drosseln, sonst die
+        # normale power-abhaengige Logik (identisch, solange kein Feed aktiv ist).
+        interval = charge_poll_interval(data, vehicle.charge_state.charger_power)
 
         {:next_state, {:charging, cproc}, data,
          [broadcast_summary(), schedule_fetch(interval, data)]}
@@ -1200,7 +1301,10 @@ defmodule TeslaMate.Vehicles.Vehicle do
           Logger.info("Charging / #{state} / #{added} kWh – #{duration} min", car_id: data.car.id)
         end)
 
-        {:next_state, :start, data, {:next_event, :internal, {:update, {:online, vehicle}}}}
+        :ok = disconnect_charge_stream(data)
+
+        {:next_state, :start, %Data{data | charge_stream_pid: nil},
+         {:next_event, :internal, {:update, {:online, vehicle}}}}
     end
   end
 
@@ -1355,7 +1459,12 @@ defmodule TeslaMate.Vehicles.Vehicle do
         {:driving, :available, drv},
         %Data{} = data
       ) do
-    interval = if streaming?(data), do: default_interval(), else: driving_interval()
+    interval =
+      cond do
+        fleet_stream_active?(data) -> fleet_driving_interval()
+        streaming?(data) -> default_interval()
+        true -> driving_interval()
+      end
 
     case vehicle do
       %Vehicle{drive_state: %Drive{shift_state: shift_state}} when shift_state in ~w(D N R) ->
@@ -1366,6 +1475,10 @@ defmodule TeslaMate.Vehicles.Vehicle do
 
             call(data.deps.locations, :find_geofence, [pos])
           end)
+
+        # Live-Feed mit dem echten Gang versorgen, falls ihm das onChange-Gear-Event
+        # entgangen ist (siehe seed_fleet_gear/2). No-op ohne aktiven Fleet-Feed.
+        seed_fleet_gear(data, shift_state)
 
         {:keep_state, %{data | last_used: DateTime.utc_now(), geofence: geofence},
          [broadcast_summary(), schedule_fetch(interval, data)]}
@@ -1951,6 +2064,45 @@ defmodule TeslaMate.Vehicles.Vehicle do
     }
   end
 
+  # Analog merge/3, aber fuer den Charge-Feed: mischt einen %ChargeStream{}-Snapshot in das
+  # letzte volle Poll-%Vehicle{}. Nur charge_state wird ueberschrieben; climate/drive/
+  # vehicle_state bleiben unangetastet. Die Ranges kommen aus dem Stream in km und werden hier
+  # zurueck nach Meilen konvertiert, weil das nachgelagerte insert_charge sie selbst wieder mit
+  # miles_to_km umrechnet (imperial-in-charge_state-Konvention wie beim echten Poll).
+  @doc false
+  def merge_charge(
+        %Vehicle{charge_state: %Charge{} = charge} = vehicle,
+        %ChargeStream{} = cs,
+        opts \\ []
+      ) do
+    timestamp =
+      if Keyword.get(opts, :time, false) and match?(%DateTime{}, cs.time) do
+        DateTime.to_unix(cs.time, :millisecond)
+      else
+        charge.timestamp
+      end
+
+    %Vehicle{
+      vehicle
+      | charge_state: %{
+          charge
+          | timestamp: timestamp,
+            charging_state: cs.charging_state,
+            charger_power: cs.charger_power,
+            charger_voltage: cs.charger_voltage,
+            charger_actual_current: cs.charger_actual_current,
+            charger_phases: cs.charger_phases,
+            charge_energy_added: cs.charge_energy_added,
+            battery_level: cs.battery_level,
+            usable_battery_level: cs.usable_battery_level,
+            ideal_battery_range: Convert.km_to_miles(cs.ideal_battery_range_km, 6),
+            battery_range: Convert.km_to_miles(cs.rated_battery_range_km, 6),
+            fast_charger_present: cs.fast_charger_present,
+            fast_charger_type: cs.fast_charger_type
+        }
+    }
+  end
+
   defp put_charge_defaults(vehicle) do
     charge_state =
       vehicle.charge_state
@@ -2014,29 +2166,178 @@ defmodule TeslaMate.Vehicles.Vehicle do
 
   defp streaming?(%Data{stream_pid: pid}), do: is_pid(pid) and Process.alive?(pid)
 
-  defp connect_stream(%Data{car: car} = data) do
-    Logger.info("Stream connecting ...", car_id: car.id)
+  defp fleet_feed_enabled?(%Data{car: %Car{vin: vin}}) do
+    System.get_env("FLEET_TELEMETRY_FEED") == "true" and
+      is_binary(vin) and vin == System.get_env("FLEET_TELEMETRY_VIN")
+  end
 
-    me = self()
+  defp fleet_feed_enabled?(_), do: false
 
-    id =
-      if System.get_env("TESLA_WSS_USE_VIN") do
-        data.car.vin
-      else
-        data.car.vid
+  # Live feed counts as active only while the StreamProvider is alive AND fresh telemetry
+  # arrived recently. The freshness gate means a quiet feed (stall) auto-expires and the
+  # interval falls back to normal polling, even though the provider stays subscribed.
+  defp fleet_stream_active?(%Data{last_stream_at: %DateTime{} = t} = data) do
+    fleet_feed_enabled?(data) and streaming?(data) and
+      DateTime.diff(DateTime.utc_now(), t, :millisecond) <= @fleet_stale_ms
+  end
+
+  defp fleet_stream_active?(_), do: false
+
+  # Charge-Feed-Gegenstuecke zu fleet_feed_enabled?/fleet_stream_active?. Eigener Flag
+  # (FLEET_TELEMETRY_FEED_CHARGING), strikt opt-in und unabhaengig vom Fahr-Feed.
+  @doc false
+  def fleet_charge_feed_enabled?(%Data{car: %Car{vin: vin}}) do
+    System.get_env("FLEET_TELEMETRY_FEED_CHARGING") == "true" and
+      is_binary(vin) and vin == System.get_env("FLEET_TELEMETRY_VIN")
+  end
+
+  def fleet_charge_feed_enabled?(_), do: false
+
+  defp charge_streaming?(%Data{charge_stream_pid: pid}), do: is_pid(pid) and Process.alive?(pid)
+
+  # Wie fleet_stream_active?, nur fuer den Charge-Feed: aktiv, solange der ChargeStreamProvider
+  # lebt UND frische Lade-Telemetrie ankam. Der Freshness-Gate laesst einen stillen Feed (Stall)
+  # ablaufen -> Rueckfall auf normales determince_interval-Polling.
+  defp charge_fleet_active?(%Data{last_charge_stream_at: %DateTime{} = t} = data) do
+    fleet_charge_feed_enabled?(data) and charge_streaming?(data) and
+      DateTime.diff(DateTime.utc_now(), t, :millisecond) <= @fleet_stale_ms
+  end
+
+  defp charge_fleet_active?(_), do: false
+
+  # Gedrosselter Lade-Poll-Takt bei frischem Feed (Default 300 s), sonst die normale
+  # determince_interval-Logik (power-abhaengig, Fallback bei Feed-Stall).
+  @doc false
+  def charge_poll_interval(%Data{} = data, power) do
+    if charge_fleet_active?(data) do
+      interval("POLLING_FLEET_CHARGING_INTERVAL", 300)
+    else
+      determince_interval(power)
+    end
+  end
+
+  # Speist den zuletzt gepollten Gang in den laufenden Fleet-StreamProvider zurueck.
+  # Grund: Fleet-Telemetry sendet `Gear` faktisch nur bei einem Gangwechsel (onChange,
+  # trotz interval_seconds-Config). Verpasst der Provider das einzelne P->D-Event beim
+  # Losfahren (Race: Wechsel vor `stream active`), bleibt sein Gang leer -> jeder
+  # Location-Trigger liefert shift_state=nil -> der FSM pollt bei jedem Punkt (10 s statt
+  # fleet_driving_interval). Dieser Seed aus dem echten vehicle_data schliesst die Luecke:
+  # ab dem naechsten Location-Trigger traegt der Stream shift_state und der poll-freie Pfad
+  # greift. Rein additiv; ein spaeteres echtes Gear-Event ueberschreibt den Seed.
+  @doc false
+  def seed_fleet_gear(%Data{stream_pid: pid} = data, shift_state) when is_pid(pid) do
+    if fleet_feed_enabled?(data) do
+      case Mapper.shift_state_to_gear(shift_state) do
+        gear when is_binary(gear) -> StreamProvider.ingest(pid, "Gear", gear)
+        _ -> :ok
       end
+    end
 
-    call(data.deps.api, :stream, [
-      id,
-      fn stream_data -> send(me, {:stream, stream_data}) end
-    ])
+    :ok
+  end
+
+  def seed_fleet_gear(%Data{}, _shift_state), do: :ok
+
+  # Charge-Feed-Gegenstueck zu seed_fleet_gear: speist den zuletzt gepollten charging_state als
+  # DetailedChargeState-Rohwert in den laufenden ChargeStreamProvider. Grund: Fleet sendet
+  # DetailedChargeState faktisch nur bei einem Phasenwechsel (onChange). Verpasst der Provider
+  # das einzelne Charging->Stopped-Event (Race: Kante vor "stream active"), bliebe seine Phase
+  # leer und das feed-getriebene Ende kaeme nie. Aufgerufen im poll-basierten :charging-Handler
+  # nach jedem insert_charge; rein additiv, ein spaeteres echtes Feed-Event ueberschreibt den Seed.
+  @doc false
+  def seed_fleet_charge_state(%Data{charge_stream_pid: pid} = data, charging_state)
+      when is_pid(pid) do
+    if fleet_charge_feed_enabled?(data) do
+      case Mapper.charge_state_to_detailed(charging_state) do
+        raw when is_binary(raw) -> StreamProvider.ingest(pid, "DetailedChargeState", raw)
+        _ -> :ok
+      end
+    end
+
+    :ok
+  end
+
+  def seed_fleet_charge_state(%Data{}, _charging_state), do: :ok
+
+  defp connect_stream(%Data{car: car} = data) do
+    if fleet_feed_enabled?(data) do
+      Logger.info("Fleet stream connecting ...", car_id: car.id)
+      me = self()
+
+      TeslaMate.FleetTelemetry.StreamProvider.start_link(
+        car_id: car.id,
+        vin: car.vin,
+        receiver: fn stream_data -> send(me, {:stream, stream_data}) end,
+        host: System.get_env("MQTT_HOST", "localhost"),
+        port: System.get_env("MQTT_PORT", "1883") |> String.to_integer(),
+        stall_ms: interval("FLEET_TELEMETRY_STALL_S", 90) * 1000
+      )
+    else
+      Logger.info("Stream connecting ...", car_id: car.id)
+
+      me = self()
+
+      id =
+        if System.get_env("TESLA_WSS_USE_VIN") do
+          data.car.vin
+        else
+          data.car.vid
+        end
+
+      call(data.deps.api, :stream, [
+        id,
+        fn stream_data -> send(me, {:stream, stream_data}) end
+      ])
+    end
   end
 
   defp disconnect_stream(%Data{stream_pid: nil}), do: :ok
 
   defp disconnect_stream(%Data{stream_pid: pid} = data) when is_pid(pid) do
     Logger.info("Stream disconnecting ...", car_id: data.car.id)
-    Stream.disconnect(pid)
+
+    if fleet_feed_enabled?(data) do
+      TeslaMate.FleetTelemetry.StreamProvider.stop(pid)
+    else
+      Stream.disconnect(pid)
+    end
+  end
+
+  # Eigener Charge-Feed-Provider fuer die {:charging}-Phase: wiederverwendeter StreamProvider mit
+  # to_charge_stream-map_fun. Triggert auf DetailedChargeState + die beiden Energie-Felder (die im
+  # Ladeverlauf am zuverlaessigsten fliessen). Nur bei aktivem Charge-Flag; sonst nil (inert).
+  defp charge_connect_stream(%Data{car: car} = data) do
+    if fleet_charge_feed_enabled?(data) do
+      Logger.info("Charge stream connecting ...", car_id: car.id)
+      me = self()
+
+      case StreamProvider.start_link(
+             car_id: car.id,
+             vin: car.vin,
+             receiver: fn payload -> send(me, {:stream_charge, payload}) end,
+             trigger_field: ["DetailedChargeState", "DCChargingEnergyIn", "ACChargingEnergyIn"],
+             map_fun: &Mapper.to_charge_stream/2,
+             host: System.get_env("MQTT_HOST", "localhost"),
+             port: System.get_env("MQTT_PORT", "1883") |> String.to_integer(),
+             stall_ms: interval("FLEET_TELEMETRY_STALL_S", 90) * 1000
+           ) do
+        {:ok, pid} ->
+          pid
+
+        error ->
+          Logger.warning("Charge stream connect failed: #{inspect(error)}", car_id: car.id)
+          nil
+      end
+    else
+      nil
+    end
+  end
+
+  defp disconnect_charge_stream(%Data{charge_stream_pid: nil}), do: :ok
+
+  defp disconnect_charge_stream(%Data{charge_stream_pid: pid} = data) when is_pid(pid) do
+    Logger.info("Charge stream disconnecting ...", car_id: data.car.id)
+    StreamProvider.stop(pid)
   end
 
   defp maybe_reconnect_stream(%Data{car: %Car{settings: settings}} = data) do

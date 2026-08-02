@@ -184,6 +184,15 @@ if System.get_env("DISABLE_MQTT") != "true" or config_env() == :test do
     ipv6: System.get_env("MQTT_IPV6") == "true"
 end
 
+if System.get_env("FLEET_TELEMETRY_SHADOW") == "true" do
+  config :teslamate, :fleet_telemetry,
+    car_id: System.get_env("FLEET_TELEMETRY_CAR_ID", "1") |> String.to_integer(),
+    vin: System.fetch_env!("FLEET_TELEMETRY_VIN"),
+    topic_base: System.get_env("FLEET_TELEMETRY_TOPIC_BASE", "fleet"),
+    host: System.get_env("MQTT_HOST", "localhost"),
+    port: System.get_env("MQTT_PORT", "1883") |> String.to_integer()
+end
+
 if config_env() != :test do
   config :teslamate,
     import_directory: System.get_env("IMPORT_DIR", "import") |> Util.validate_import_dir()

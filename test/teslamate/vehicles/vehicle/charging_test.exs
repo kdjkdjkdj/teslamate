@@ -283,4 +283,225 @@ defmodule TeslaMate.Vehicles.Vehicle.ChargingTest do
 
     refute_receive _
   end
+
+  describe "merge_charge/3" do
+    test "uebernimmt Ladefelder aus dem Snapshot, laesst climate unberuehrt" do
+      vehicle = %TeslaApi.Vehicle{
+        charge_state: %TeslaApi.Vehicle.State.Charge{
+          charging_state: "Charging",
+          battery_level: 50,
+          usable_battery_level: 49,
+          charger_power: 2,
+          charge_energy_added: 1.0,
+          ideal_battery_range: 100.0,
+          battery_range: 100.0,
+          timestamp: 1000
+        },
+        climate_state: %TeslaApi.Vehicle.State.Climate{outside_temp: 21.5, inside_temp: 22.0}
+      }
+
+      cs = %TeslaMate.FleetTelemetry.ChargeStream{
+        time: ~U[2026-07-12 12:18:56Z],
+        charging_state: "DetailedChargeStateStopped",
+        charger_power: 11,
+        charger_voltage: 224,
+        charger_actual_current: 16,
+        charger_phases: 2,
+        charge_energy_added: 24.8,
+        battery_level: 63,
+        usable_battery_level: 62,
+        ideal_battery_range_km: 297.7,
+        rated_battery_range_km: 297.7,
+        fast_charger_present: false,
+        fast_charger_type: "ACSingleWireCAN"
+      }
+
+      merged = TeslaMate.Vehicles.Vehicle.merge_charge(vehicle, cs, time: true)
+
+      assert merged.charge_state.charging_state == "DetailedChargeStateStopped"
+      assert merged.charge_state.charger_power == 11
+      assert merged.charge_state.charger_voltage == 224
+      assert merged.charge_state.charger_actual_current == 16
+      assert merged.charge_state.charger_phases == 2
+      assert merged.charge_state.charge_energy_added == 24.8
+      assert merged.charge_state.battery_level == 63
+      assert merged.charge_state.usable_battery_level == 62
+      assert merged.charge_state.fast_charger_present == false
+      assert merged.charge_state.fast_charger_type == "ACSingleWireCAN"
+      # km -> mi zurueck (insert_charge rechnet selbst wieder in km)
+      assert_in_delta merged.charge_state.ideal_battery_range, 185.0, 0.5
+      assert_in_delta merged.charge_state.battery_range, 185.0, 0.5
+      # timestamp aus cs.time (opts[:time])
+      assert merged.charge_state.timestamp ==
+               DateTime.to_unix(~U[2026-07-12 12:18:56Z], :millisecond)
+      # climate unangetastet
+      assert merged.climate_state.outside_temp == 21.5
+      assert merged.climate_state.inside_temp == 22.0
+    end
+
+    test "ohne opts[:time] bleibt der bestehende timestamp erhalten" do
+      vehicle = %TeslaApi.Vehicle{
+        charge_state: %TeslaApi.Vehicle.State.Charge{timestamp: 1000, battery_level: 50}
+      }
+
+      cs = %TeslaMate.FleetTelemetry.ChargeStream{time: ~U[2026-07-12 12:18:56Z], battery_level: 63}
+      merged = TeslaMate.Vehicles.Vehicle.merge_charge(vehicle, cs)
+      assert merged.charge_state.timestamp == 1000
+      assert merged.charge_state.battery_level == 63
+    end
+  end
+
+  describe "charge feed :charging (Verdichtung + Ende)" do
+    # Bringt den FSM per Poll in {:charging, cproc} und haelt ihn dort (blockierendes
+    # Poll-Event), sodass injizierte {:stream_charge, cs}-Nachrichten isoliert wirken.
+    defp events_into_charging(me, now_ts, tail) do
+      [
+        {:ok, online_event(now_ts)},
+        {:ok,
+         online_event(now_ts, drive_state: %{timestamp: now_ts, latitude: 0.0, longitude: 0.0})},
+        {:ok, charging_event(now_ts + 1, "Charging", 0.1, range: 1)},
+        fn ->
+          send(me, :charging_reached)
+
+          receive do
+            :cont -> {:error, :closed}
+          after
+            5_000 -> raise "no :cont"
+          end
+        end
+      ] ++ tail
+    end
+
+    test "{:stream_charge, Charging} verdichtet die Kurve via insert_charge", %{test: name} do
+      me = self()
+      now_ts = DateTime.utc_now() |> DateTime.to_unix(:millisecond)
+
+      :ok = start_vehicle(name, events_into_charging(me, now_ts, [fn -> Process.sleep(10_000) end]))
+
+      assert_receive {:start_charging_process, _car, _, _}, 800
+      assert_receive {:insert_charge, cproc, %{charge_energy_added: 0.1}}, 800
+      assert_receive :charging_reached, 800
+
+      cs = %TeslaMate.FleetTelemetry.ChargeStream{
+        time: DateTime.utc_now(),
+        charging_state: "DetailedChargeStateCharging",
+        charger_power: 11,
+        charger_voltage: 224,
+        charge_energy_added: 5.5,
+        battery_level: 55,
+        rated_battery_range_km: 100.0,
+        ideal_battery_range_km: 100.0
+      }
+
+      send(name, {:stream_charge, cs})
+
+      assert_receive {:insert_charge, ^cproc,
+                      %{charge_energy_added: 5.5, charger_power: 11, battery_level: 55}},
+                     800
+    end
+
+    test "{:stream_charge, Stopped} beendet die Ladung feed-getrieben", %{test: name} do
+      me = self()
+      now_ts = DateTime.utc_now() |> DateTime.to_unix(:millisecond)
+
+      tail = [
+        {:ok,
+         online_event(now_ts + 9,
+           drive_state: %{timestamp: now_ts + 9, latitude: 0.2, longitude: 0.2}
+         )},
+        fn -> Process.sleep(10_000) end
+      ]
+
+      :ok = start_vehicle(name, events_into_charging(me, now_ts, tail))
+
+      assert_receive {:insert_charge, cproc, %{charge_energy_added: 0.1}}, 800
+      assert_receive :charging_reached, 800
+
+      cs = %TeslaMate.FleetTelemetry.ChargeStream{
+        time: DateTime.utc_now(),
+        charging_state: "DetailedChargeStateStopped",
+        charger_power: 0,
+        charge_energy_added: 6.0,
+        battery_level: 60,
+        rated_battery_range_km: 120.0,
+        ideal_battery_range_km: 120.0
+      }
+
+      send(name, {:stream_charge, cs})
+
+      # letzter Kurvenpunkt akkuseitig + prompter Abschluss (nicht +interval)
+      assert_receive {:insert_charge, ^cproc, %{charge_energy_added: 6.0}}, 800
+      assert_receive {:complete_charging_process, ^cproc}, 800
+      # Uebergang -> :start -> frischer Poll -> :online
+      assert_receive {:start_state, _car, :online, _}, 1500
+    end
+
+    test "{:stream_charge, :fleet_streaming} ist ein reiner Freshness-Ping (kein insert)",
+         %{test: name} do
+      me = self()
+      now_ts = DateTime.utc_now() |> DateTime.to_unix(:millisecond)
+
+      :ok = start_vehicle(name, events_into_charging(me, now_ts, [fn -> Process.sleep(10_000) end]))
+
+      assert_receive {:insert_charge, _cproc, %{charge_energy_added: 0.1}}, 800
+      assert_receive :charging_reached, 800
+
+      send(name, {:stream_charge, :fleet_streaming})
+      refute_receive {:insert_charge, _, _}, 200
+      refute_receive {:complete_charging_process, _}, 50
+    end
+
+    test "Lebenszyklus: ChargeStreamProvider bei :charging-Eintritt gestartet, bei Ende gestoppt",
+         %{test: name} do
+      System.put_env("FLEET_TELEMETRY_FEED_CHARGING", "true")
+      System.put_env("FLEET_TELEMETRY_VIN", "1000")
+
+      on_exit(fn ->
+        System.delete_env("FLEET_TELEMETRY_FEED_CHARGING")
+        System.delete_env("FLEET_TELEMETRY_VIN")
+      end)
+
+      me = self()
+      now_ts = DateTime.utc_now() |> DateTime.to_unix(:millisecond)
+
+      tail = [
+        {:ok,
+         online_event(now_ts + 9,
+           drive_state: %{timestamp: now_ts + 9, latitude: 0.2, longitude: 0.2}
+         )},
+        fn -> Process.sleep(10_000) end
+      ]
+
+      :ok = start_vehicle(name, events_into_charging(me, now_ts, tail))
+
+      assert_receive :charging_reached, 800
+
+      # Provider laeuft, charge_stream_pid ist gesetzt
+      {{:charging, _cproc}, data} = :sys.get_state(name)
+      assert is_pid(data.charge_stream_pid)
+      assert Process.alive?(data.charge_stream_pid)
+      pid = data.charge_stream_pid
+
+      # feed-getriebenes Ende -> Provider gestoppt + pid aus Data
+      send(name, {:stream_charge,
+       %TeslaMate.FleetTelemetry.ChargeStream{
+         time: DateTime.utc_now(),
+         charging_state: "DetailedChargeStateStopped",
+         charge_energy_added: 6.0,
+         battery_level: 60
+       }})
+
+      assert_receive {:complete_charging_process, _}, 800
+      assert_receive {:start_state, _car, :online, _}, 1500
+
+      {_state, data2} = :sys.get_state(name)
+      assert data2.charge_stream_pid == nil
+
+      # Provider gestoppt (kurze Grace-Periode fuer den async Tortoise-Abbau).
+      assert Enum.any?(1..20, fn _ ->
+               if Process.alive?(pid), do: Process.sleep(10)
+               not Process.alive?(pid)
+             end)
+    end
+  end
 end

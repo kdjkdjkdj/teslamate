@@ -504,6 +504,8 @@ defmodule TeslaMate.Log do
 
     with {:ok, cproc} <- charging_process |> ChargingProcess.changeset(attrs) |> Repo.update(),
          {:ok, _car} <- recalculate_efficiency(charging_process.car, settings) do
+      # Stoesst einen entprellten SuC-Kosten-Sync an (async, beeinflusst Rueckgabewert nicht).
+      TeslaMate.ChargeCost.SyncServer.nudge()
       {:ok, cproc}
     end
   end

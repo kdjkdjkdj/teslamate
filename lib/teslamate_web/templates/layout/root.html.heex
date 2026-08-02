@@ -113,6 +113,12 @@
               <span class="icon"><i class="mdi mdi-map-marker-radius"></i></span>&nbsp;<span><%= gettext("Geo-Fences") %></span>
             </.link>
             <.link
+              navigate={Routes.live_path(@conn, TeslaMateWeb.ChargeCostLive.Index)}
+              class="navbar-item  mr-5"
+            >
+              <span class="icon"><i class="mdi mdi-ev-station"></i></span>&nbsp;<span><%= gettext("SuC Costs") %></span>
+            </.link>
+            <.link
               navigate={Routes.live_path(@conn, TeslaMateWeb.SettingsLive.Index)}
               class="navbar-item  mr-5"
             >

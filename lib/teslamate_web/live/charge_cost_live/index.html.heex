@@ -1,0 +1,79 @@
+<nav class="breadcrumb" aria-label="breadcrumbs">
+  <ul>
+    <li><.link navigate={~p"/"}><%= gettext("Home") %></.link></li>
+    <li class="is-active"><.link navigate=""><%= gettext("Supercharger Cost Import") %></.link></li>
+  </ul>
+</nav>
+
+<div class="container">
+  <h2 class="title is-4"><%= gettext("Supercharger Cost Import") %></h2>
+  <p class="subtitle is-6">
+    <%= gettext("Fetch real Supercharger fees from Tesla and write them to matching charges. Cost basis is taken from Settings.") %>
+  </p>
+
+  <form phx-submit="run">
+    <div class="field">
+      <label class="label"><%= gettext("Range") %></label>
+      <div class="control">
+        <div class="select is-fullwidth">
+          <select name="range">
+            <option value="all"><%= gettext("All charges") %></option>
+            <option value="last_12_months"><%= gettext("Last 12 months") %></option>
+            <option value="last_30_days"><%= gettext("Last 30 days") %></option>
+          </select>
+        </div>
+      </div>
+    </div>
+
+    <div class="field">
+      <label class="checkbox">
+        <input type="checkbox" name="orphans" value="true" />
+        <%= gettext("Create charges billed by Tesla that have no TeslaMate record (orphans)") %>
+      </label>
+    </div>
+
+    <div class="field mt-4">
+      <button
+        class="button is-success is-fullwidth"
+        disabled={@running? or @cars == []}
+        phx-disable-with={gettext("Running...")}
+      >
+        <%= gettext("Start backfill") %>
+      </button>
+    </div>
+  </form>
+
+  <%= if @cars == [] do %>
+    <div class="notification is-warning mt-4"><%= gettext("No vehicles found.") %></div>
+  <% end %>
+
+  <%= if map_size(@results) > 0 do %>
+    <div class="table-container mt-5">
+      <table class="table is-narrow is-hoverable is-fullwidth">
+        <thead>
+          <tr>
+            <th><%= gettext("Vehicle") %></th>
+            <th><%= gettext("Matched") %></th>
+            <th><%= gettext("Orphans") %></th>
+            <th><%= gettext("Created") %></th>
+          </tr>
+        </thead>
+        <tbody>
+          <%= for {_id, {car, result}} <- @results do %>
+            <tr>
+              <td><%= car.name || car.vin %></td>
+              <%= case result do %>
+                <% %{matched: m, orphans: o, created: c} -> %>
+                  <td><%= m %></td>
+                  <td><%= o %></td>
+                  <td><%= c %></td>
+                <% {:error, reason} -> %>
+                  <td colspan="3" class="has-text-danger"><%= inspect(reason) %></td>
+              <% end %>
+            </tr>
+          <% end %>
+        </tbody>
+      </table>
+    </div>
+  <% end %>
+</div>

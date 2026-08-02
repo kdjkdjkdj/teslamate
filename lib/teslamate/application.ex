@@ -18,6 +18,7 @@ defmodule TeslaMate.Application do
 
   defp children do
     mqtt_config = Application.get_env(:teslamate, :mqtt)
+    fleet_config = Application.get_env(:teslamate, :fleet_telemetry)
 
     case Application.get_env(:teslamate, :import_directory) do
       nil ->
@@ -32,7 +33,12 @@ defmodule TeslaMate.Application do
           TeslaMate.Terrain,
           TeslaMate.Vehicles,
           if(mqtt_config != nil, do: {TeslaMate.Mqtt, mqtt_config}),
-          TeslaMate.Repair
+          if(fleet_config != nil, do: {TeslaMate.FleetTelemetry, fleet_config}),
+          if(System.get_env("FLEET_TELEMETRY_CHARGE_BACKFILL") == "true",
+            do: TeslaMate.FleetTelemetry.ChargeBackfill
+          ),
+          TeslaMate.Repair,
+          TeslaMate.ChargeCost.SyncServer
         ]
         |> Enum.reject(&is_nil/1)
 

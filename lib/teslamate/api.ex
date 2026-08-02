@@ -55,6 +55,16 @@ defmodule TeslaMate.Api do
     end
   end
 
+  def get_charging_history(vin, opts \\ []) when is_binary(vin) do
+    get_charging_history(@name, vin, opts)
+  end
+
+  def get_charging_history(name, vin, opts) when is_list(opts) do
+    with {:ok, auth} <- fetch_auth(name) do
+      TeslaApi.Charging.history(auth, vin, opts)
+    end
+  end
+
   ## Internals
 
   def signed_in?(name \\ @name) do
