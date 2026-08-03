@@ -181,6 +181,39 @@ defmodule TeslaMate.FleetTelemetry.StreamProviderTest do
       assert_receive {:stream, %StreamData{est_lat: 7.0, odometer: nil}}, 200
     end
 
+    test "Alternativgruppe: eines der Felder genuegt" do
+      # Die Lade-Energie kommt als DC- ODER AC-Feld. Beide zu fordern waere nie erfuellbar,
+      # DC-Laden sendet kein AC-Feld und umgekehrt.
+      pid = start(require_fields: [["DCChargingEnergyIn", "ACChargingEnergyIn"]])
+
+      StreamProvider.ingest(pid, "Location", %{"latitude" => 1.0, "longitude" => 2.0})
+      refute_receive {:stream, _}, 100
+
+      StreamProvider.ingest(pid, "ACChargingEnergyIn", 1.78)
+      StreamProvider.ingest(pid, "Location", %{"latitude" => 3.0, "longitude" => 4.0})
+      assert_receive {:stream, %StreamData{est_lat: 3.0}}, 200
+    end
+
+    test "Alternativgruppe: das andere Feld genuegt genauso" do
+      pid = start(require_fields: [["DCChargingEnergyIn", "ACChargingEnergyIn"]])
+
+      StreamProvider.ingest(pid, "DCChargingEnergyIn", 4.2)
+      StreamProvider.ingest(pid, "Location", %{"latitude" => 5.0, "longitude" => 6.0})
+      assert_receive {:stream, %StreamData{est_lat: 5.0}}, 200
+    end
+
+    test "Einzelfeld und Alternativgruppe zusammen: beide Bedingungen muessen erfuellt sein" do
+      pid = start(require_fields: ["IdealBatteryRange", ["DCChargingEnergyIn", "ACChargingEnergyIn"]])
+
+      StreamProvider.ingest(pid, "ACChargingEnergyIn", 1.78)
+      StreamProvider.ingest(pid, "Location", %{"latitude" => 1.0, "longitude" => 2.0})
+      refute_receive {:stream, _}, 100
+
+      StreamProvider.ingest(pid, "IdealBatteryRange", 115.0)
+      StreamProvider.ingest(pid, "Location", %{"latitude" => 7.0, "longitude" => 8.0})
+      assert_receive {:stream, %StreamData{est_lat: 7.0}}, 200
+    end
+
     test "emit_always laesst das Ereignis trotz fehlendem Pflichtfeld sofort durch" do
       me = self()
 

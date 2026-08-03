@@ -1795,7 +1795,7 @@ defmodule TeslaMate.Vehicles.Vehicle do
     Map.put(position, :elevation, elevation)
   end
 
-  defp create_position(%Stream.Data{} = stream_data, %Data{}) do
+  defp create_position(%Stream.Data{} = stream_data, %Data{} = data) do
     %{
       date: stream_data.time,
       latitude: stream_data.est_lat,
@@ -1804,9 +1804,24 @@ defmodule TeslaMate.Vehicles.Vehicle do
       speed: Convert.mph_to_kmh(stream_data.speed),
       battery_level: stream_data.soc,
       elevation: stream_data.elevation,
-      odometer: Convert.miles_to_km(stream_data.odometer, 6)
+      # Letzte Verteidigungslinie fuer den Kilometerstand. Hier wird die ERSTE Position einer
+      # Fahrt geschrieben, und `close_drive` nimmt `first_value(p.odometer)` als `start_km` -
+      # ist sie NULL, bleiben `start_km` UND `distance` dauerhaft NULL, ohne jede Meldung
+      # (Log.Drive verlangt nur car_id + start_date). Der Feed-Seed (seed_fleet_odometer/2)
+      # verhindert das im Regelfall, greift aber nicht, wenn seit dem Start noch kein Poll lief.
+      #
+      # Fortschreiben ist hier - anders als bei `charge_energy_added` - gefahrlos: der Odometer
+      # ist monoton und das Auto stand bis zu diesem Moment. Ein Wert vom letzten Poll ist um
+      # die seither gefahrene Strecke zu klein, und die ist beim Losfahren null.
+      odometer: Convert.miles_to_km(keep(stream_data.odometer, last_odometer(data)), 6)
     }
   end
+
+  defp last_odometer(%Data{last_response: %Vehicle{vehicle_state: %VehicleState{odometer: odo}}})
+       when is_number(odo),
+       do: odo
+
+  defp last_odometer(_data), do: nil
 
   defp insert_charge(charging_process, %Vehicle{} = vehicle, data) do
     attrs = %{
@@ -2124,9 +2139,19 @@ defmodule TeslaMate.Vehicles.Vehicle do
   #    `charge_energy_used` (3,31 statt 5,37 kWh), das unter `charge_energy_added` lag.
   #    Fortschreiben macht die Session homogen und gibt der Heuristik vollstaendige Daten.
   #
-  # Bewusst NICHT fortgeschrieben: `charging_state` (eine Phase ist eine Aussage, kein
-  # Fuellwert - sonst wird eine echte Stopped-Kante verschleiert), `charger_power` und
-  # `charge_energy_added` (put_charge_defaults/1 hat dafuer eigene 0-Defaults).
+  # Bewusst NICHT fortgeschrieben:
+  #
+  # - `charging_state`: eine Phase ist eine Aussage, kein Fuellwert - sonst wird eine echte
+  #   Stopped-Kante verschleiert.
+  # - `charger_power`: `insert_charge` defaultet inline auf 0.
+  # - `charge_energy_added`: ⚠️ hier waere Fortschreiben SCHAEDLICH. Der Zaehler der VORIGEN
+  #   Ladung wuerde als Startwert der neuen erscheinen und die Kurve verfaelschen - schlimmer
+  #   als eine Luecke. Deshalb sichert das Warm-up-Gate dieses Feld ab (Alternativgruppe
+  #   DC/AC-Energie in charge_connect_stream/1), nicht keep/2.
+  #
+  # ⚠️ Korrektur einer frueheren Begruendung hier: `put_charge_defaults/1` laeuft NUR auf dem
+  # Poll-Pfad (die zwei Aufrufe bei den Wach-Uebergaengen), NICHT auf dem Feed-Pfad. Es taugt
+  # also nicht als Argument fuer den Feed.
   defp keep(nil, previous), do: previous
   defp keep(value, _previous), do: value
 
@@ -2408,9 +2433,15 @@ defmodule TeslaMate.Vehicles.Vehicle do
              receiver: fn payload -> send(me, {:stream_charge, payload}) end,
              trigger_field: ["DetailedChargeState", "DCChargingEnergyIn", "ACChargingEnergyIn"],
              map_fun: &Mapper.to_charge_stream/2,
-             # insert_charge verlangt ideal_battery_range_km; fehlt es, faellt die ganze
-             # Kurvenzeile weg. Das Lade-ENDE darf der Gate aber nie zurueckhalten.
-             require_fields: ["IdealBatteryRange"],
+             # Charge.changeset verlangt drei payload-abhaengige Felder, jedes fuer sich
+             # hinreichend zum Verwerfen der Kurvenzeile: charge_energy_added, charger_power
+             # und ideal_battery_range_km. charger_power defaultet insert_charge inline
+             # (`|| 0`); die anderen zwei muessen echt da sein. Die Energie kommt als DC- ODER
+             # AC-Feld -> Alternativgruppe. Das Lade-ENDE darf der Gate nie zurueckhalten.
+             require_fields: [
+               "IdealBatteryRange",
+               ["DCChargingEnergyIn", "ACChargingEnergyIn"]
+             ],
              warmup_ms: interval("FLEET_TELEMETRY_WARMUP_S", 60) * 1000,
              emit_always: &terminal_charge_field?/2,
              host: System.get_env("MQTT_HOST", "localhost"),

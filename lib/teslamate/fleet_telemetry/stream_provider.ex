@@ -22,7 +22,8 @@ defmodule TeslaMate.FleetTelemetry.StreamProvider do
   Online-Uebergang. Connect-Fehler werden jetzt tolerant behandelt (degraded statt
   Crash).
 
-  Warm-up-Gate (`require_fields`): Eine Session beginnt nicht mit allen Feldern -
+  Warm-up-Gate (`require_fields`, Eintraege duerfen Alternativlisten sein): Eine Session
+  beginnt nicht mit allen Feldern -
   Fleet sendet on-change mit Mindestabstand, ein Payload traegt im Schnitt 48,5 von
   59 Feldern. Emittiert der Provider schon auf den ersten Trigger, entsteht eine
   halbleere Startzeile, die stromabwaerts Schaden anrichtet (Position ohne Odometer
@@ -68,8 +69,10 @@ defmodule TeslaMate.FleetTelemetry.StreamProvider do
       # und wird so ueber denselben Provider (client_id/terminate/Stall/connect) wiederverwendet.
       map_fun: Keyword.get(opts, :map_fun, &Mapper.to_stream_data/2),
       stall_ms: Keyword.get(opts, :stall_ms, @stall_ms),
-      # Warm-up-Gate (siehe @moduledoc): Felder, die vor dem ERSTEN Emit dagewesen
-      # sein muessen. Leer = Gate aus (Default, Verhalten unveraendert).
+      # Warm-up-Gate (siehe @moduledoc): Felder, die vor dem ERSTEN Emit dagewesen sein
+      # muessen. Leer = Gate aus (Default, Verhalten unveraendert). Ein Eintrag darf eine
+      # LISTE von Alternativen sein - dann genuegt eines davon (z.B. DC- ODER AC-Energie:
+      # beide zu fordern waere nie erfuellbar, DC-Laden sendet kein AC-Feld).
       require_fields: Keyword.get(opts, :require_fields, []),
       warmup_ms: Keyword.get(opts, :warmup_ms, @warmup_ms),
       # Ausnahme vom Gate: (field, value) -> true erzwingt den Emit auch im Warm-up.
@@ -180,7 +183,16 @@ defmodule TeslaMate.FleetTelemetry.StreamProvider do
   end
 
   defp missing(%{require_fields: req}, fs) do
-    Enum.filter(req, &is_nil(FieldState.get(fs, &1)))
+    Enum.reject(req, &satisfied?(&1, fs))
+  end
+
+  # Alternativgruppe: eines der Felder genuegt. Einzelfeld: es selbst muss da sein.
+  defp satisfied?(alternatives, fs) when is_list(alternatives) do
+    Enum.any?(alternatives, &(not is_nil(FieldState.get(fs, &1))))
+  end
+
+  defp satisfied?(field, fs) when is_binary(field) do
+    not is_nil(FieldState.get(fs, field))
   end
 
   defp arm_timer(%{timer: t, stall_ms: ms} = st) do
