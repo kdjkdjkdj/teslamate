@@ -1851,11 +1851,7 @@ defmodule TeslaMate.Vehicles.Vehicle do
   end
 
   defp try_to_suspend(vehicle, current_state, %Data{car: car} = data) do
-    {suspend_after_idle_min, suspend_min, i} =
-      case {car.settings, stream_reliable_for_suspend?(data)} do
-        {%CarSettings{use_streaming_api: true}, true} -> {3, 30, 2}
-        {%CarSettings{suspend_after_idle_min: i, suspend_min: s}, _} -> {i, s, 1}
-      end
+    {suspend_after_idle_min, suspend_min, i} = suspend_params(data)
 
     suspend? = diff_seconds(DateTime.utc_now(), data.last_used) / 60 >= suspend_after_idle_min
     service_mode? = service_mode?(vehicle)
@@ -2204,6 +2200,32 @@ defmodule TeslaMate.Vehicles.Vehicle do
   # auf einen Stream, der im Stand nichts sendet - der Fahr-Feed triggert auf `Location`, und
   # ein parkendes Auto liefert keine. Eine im Stand beginnende Ladung blieb so bis zu 30 min
   # unerfasst (gemessen 2026-08-03: 11 min Heimladung). Ohne Fleet-Feed unveraendert.
+  # Suspend-Parameter: {Leerlauf bis Suspend, Suspend-Dauer, Poll-Intervall-Multiplikator}.
+  #
+  # Upstream nimmt bei lebendigem Streaming {3, 30, 2}: frueh aufhoeren zu pollen und lange
+  # wegbleiben, weil der Stream weckt. Unser Fleet-Feed weckt nicht - er triggert auf
+  # `Location`, die im Stand nie kommt. Falsch daran waren aber NUR die 30 Minuten. Frueh
+  # aufhoeren (3 min) und der doppelte Poll-Abstand sind harmlos, solange die Suspend-DAUER
+  # die Blindheit begrenzt. Ein pauschaler Rueckfall auf die Fahrzeugeinstellungen {15, 12, 1}
+  # kostete dagegen ~60 statt ~6 Polls pro Parkvorgang (gemessen 2026-08-03: 15,2 s Abstand,
+  # 26 Polls in 6,5 min) = ~0,12 EUR statt ~0,012 EUR. Bei hartem 10-EUR-Monatslimit nicht
+  # tragbar, deshalb: Eile behalten, nur die Dauer kappen.
+  #
+  # Ohne Fleet-Feed bleibt das Upstream-Verhalten in beiden Zweigen unangetastet.
+  @doc false
+  def suspend_params(%Data{car: %Car{settings: settings}} = data) do
+    case {settings, stream_reliable_for_suspend?(data)} do
+      {%CarSettings{use_streaming_api: true}, true} ->
+        {3, 30, 2}
+
+      {%CarSettings{use_streaming_api: true, suspend_after_idle_min: idle, suspend_min: s}, false} ->
+        if fleet_feed_enabled?(data), do: {3, s, 2}, else: {idle, s, 1}
+
+      {%CarSettings{suspend_after_idle_min: idle, suspend_min: s}, _} ->
+        {idle, s, 1}
+    end
+  end
+
   defp stream_reliable_for_suspend?(%Data{} = data) do
     if fleet_feed_enabled?(data) do
       fleet_stream_active?(data)
