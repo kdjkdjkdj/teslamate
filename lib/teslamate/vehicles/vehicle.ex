@@ -2089,12 +2089,13 @@ defmodule TeslaMate.Vehicles.Vehicle do
           | timestamp: timestamp,
             charging_state: cs.charging_state,
             charger_power: cs.charger_power,
-            charger_voltage: cs.charger_voltage,
-            charger_actual_current: cs.charger_actual_current,
-            charger_phases: cs.charger_phases,
+            charger_voltage: keep(cs.charger_voltage, charge.charger_voltage),
+            charger_actual_current:
+              keep(cs.charger_actual_current, charge.charger_actual_current),
+            charger_phases: keep(cs.charger_phases, charge.charger_phases),
             charge_energy_added: cs.charge_energy_added,
-            battery_level: cs.battery_level,
-            usable_battery_level: cs.usable_battery_level,
+            battery_level: keep(cs.battery_level, charge.battery_level),
+            usable_battery_level: keep(cs.usable_battery_level, charge.usable_battery_level),
             ideal_battery_range:
               keep(Convert.km_to_miles(cs.ideal_battery_range_km, 6), charge.ideal_battery_range),
             battery_range:
@@ -2105,11 +2106,27 @@ defmodule TeslaMate.Vehicles.Vehicle do
     }
   end
 
-  # Ein `nil` aus dem Feed heisst "noch nicht geliefert", nicht "auf null gefallen". Fuer die
-  # Ranges darf es den letzten gepollten Wert deshalb nicht loeschen: `ideal_battery_range_km`
-  # steht in Charge.changeset unter validate_required, eine Zeile ohne ihn wird komplett
-  # verworfen. Damit wird auch der Warm-up-Timeout-Zweig brauchbar, statt eine Zeile zu
-  # erzeugen, die insert_charge wegwirft.
+  # Ein `nil` aus dem Feed heisst "noch nicht geliefert", nicht "auf null gefallen" - der
+  # letzte gepollte Wert darf davon nicht geloescht werden. Zwei Schadensbilder, beide
+  # gemessen 2026-08-03:
+  #
+  # 1. Ranges: `ideal_battery_range_km` steht in Charge.changeset unter validate_required,
+  #    eine Zeile ohne ihn wird von insert_charge KOMPLETT verworfen. Damit wird auch der
+  #    Warm-up-Timeout-Zweig brauchbar statt eine Zeile zu erzeugen, die wegfliegt.
+  #
+  # 2. `charger_phases`/`charger_actual_current`/`charger_voltage`: `ChargerPhases` (60 s) und
+  #    `ChargeAmps` (30 s) kommen onChange und aendern sich bei konstantem AC-Laden nie, also
+  #    erreichen sie den frischen Provider-FieldState einer Session gar nicht. Das nil machte
+  #    die Session INHOMOGEN - Ladung #381 hatte 47 Zeilen mit Phasen und 70 ohne. Genau daran
+  #    verzweigt TeslaMates Energie-Integration (`is_nil(charger_phases)` -> `charger_power`,
+  #    sonst I*V*Phasen), und `determine_phases` liefert bei so gemischten Daten `nil` zurueck
+  #    -> alle Zeilen MIT Phasen tragen NULL bei. Ergebnis war ein zu kleines
+  #    `charge_energy_used` (3,31 statt 5,37 kWh), das unter `charge_energy_added` lag.
+  #    Fortschreiben macht die Session homogen und gibt der Heuristik vollstaendige Daten.
+  #
+  # Bewusst NICHT fortgeschrieben: `charging_state` (eine Phase ist eine Aussage, kein
+  # Fuellwert - sonst wird eine echte Stopped-Kante verschleiert), `charger_power` und
+  # `charge_energy_added` (put_charge_defaults/1 hat dafuer eigene 0-Defaults).
   defp keep(nil, previous), do: previous
   defp keep(value, _previous), do: value
 

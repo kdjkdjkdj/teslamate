@@ -370,6 +370,61 @@ defmodule TeslaMate.Vehicles.Vehicle.ChargingTest do
       assert merged.charge_state.charging_state == "DetailedChargeStateCharging"
     end
 
+    test "nil bei Phasen/Strom/Spannung/SoC behaelt die gepollten Werte" do
+      # ChargerPhases (60 s) und ChargeAmps (30 s) kommen onChange und aendern sich bei
+      # konstantem AC-Laden nie -> sie erreichen den frischen FieldState einer Session nie.
+      # Wuerde das nil durchgeschrieben, waere die Session inhomogen und TeslaMates
+      # Energie-Integration verzweigt je Zeile anders (Ladung #381: 3,31 statt 5,37 kWh).
+      vehicle = %TeslaApi.Vehicle{
+        charge_state: %TeslaApi.Vehicle.State.Charge{
+          charging_state: "Charging",
+          charger_voltage: 222,
+          charger_actual_current: 16,
+          charger_phases: 2,
+          battery_level: 19,
+          usable_battery_level: 18,
+          ideal_battery_range: 185.0,
+          battery_range: 186.0
+        }
+      }
+
+      cs = %TeslaMate.FleetTelemetry.ChargeStream{
+        time: ~U[2026-08-03 12:56:17Z],
+        charging_state: "DetailedChargeStateCharging",
+        charger_power: 11,
+        charger_voltage: nil,
+        charger_actual_current: nil,
+        charger_phases: nil,
+        battery_level: nil,
+        usable_battery_level: nil
+      }
+
+      merged = TeslaMate.Vehicles.Vehicle.merge_charge(vehicle, cs, time: true)
+
+      assert merged.charge_state.charger_voltage == 222
+      assert merged.charge_state.charger_actual_current == 16
+      assert merged.charge_state.charger_phases == 2
+      assert merged.charge_state.battery_level == 19
+      assert merged.charge_state.usable_battery_level == 18
+      # was der Feed liefert, gewinnt weiterhin
+      assert merged.charge_state.charger_power == 11
+      assert merged.charge_state.charging_state == "DetailedChargeStateCharging"
+    end
+
+    test "charging_state wird NICHT fortgeschrieben - eine Phase ist eine Aussage" do
+      vehicle = %TeslaApi.Vehicle{
+        charge_state: %TeslaApi.Vehicle.State.Charge{charging_state: "Charging"}
+      }
+
+      cs = %TeslaMate.FleetTelemetry.ChargeStream{
+        time: ~U[2026-08-03 12:56:17Z],
+        charging_state: nil
+      }
+
+      merged = TeslaMate.Vehicles.Vehicle.merge_charge(vehicle, cs)
+      assert merged.charge_state.charging_state == nil
+    end
+
     test "ein Wert aus dem Feed gewinnt gegen den gepollten" do
       vehicle = %TeslaApi.Vehicle{
         charge_state: %TeslaApi.Vehicle.State.Charge{ideal_battery_range: 1.0, battery_range: 1.0}
