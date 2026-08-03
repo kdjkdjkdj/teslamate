@@ -78,6 +78,9 @@ defmodule TeslaMate.FleetTelemetry.StreamProvider do
       # Ausnahme vom Gate: (field, value) -> true erzwingt den Emit auch im Warm-up.
       # Der Lade-Feed laesst so die Stopped/Complete-Kante immer durch.
       emit_always: Keyword.get(opts, :emit_always, fn _field, _value -> false end),
+      # Nur fuer die Logzeilen: derselbe Provider bedient Fahr-, Lade- und Ladewaechter-Feed,
+      # und "feeding live positions" waere fuer die letzten zwei irrefuehrend.
+      label: Keyword.get(opts, :label, "FleetTelemetry stream"),
       warmup?: true,
       started_at: DateTime.utc_now(),
       streaming?: false,
@@ -127,7 +130,7 @@ defmodule TeslaMate.FleetTelemetry.StreamProvider do
           safe_emit(st.receiver, :fleet_streaming)
 
           if not st.streaming? do
-            Logger.info("FleetTelemetry stream active - feeding live positions")
+            Logger.info("#{st.label} active - receiving live data")
           end
 
           arm_timer(%{st | streaming?: true, warmup?: false})
@@ -139,9 +142,7 @@ defmodule TeslaMate.FleetTelemetry.StreamProvider do
   @impl true
   def handle_info(:stall, st) do
     if st.streaming? do
-      Logger.info(
-        "FleetTelemetry stream stalled (> #{st.stall_ms}ms) - poll fallback, staying subscribed"
-      )
+      Logger.info("#{st.label} stalled (> #{st.stall_ms}ms) - poll fallback, staying subscribed")
     end
 
     # Bewusst KEIN Stop: subscribed bleiben und auf Rueckkehr der Daten warten.

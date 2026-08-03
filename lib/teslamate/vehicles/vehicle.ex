@@ -36,6 +36,14 @@ defmodule TeslaMate.Vehicles.Vehicle do
               # curve (insert_charge) from the feed and throttles the charge poll (charge_fleet_active?).
               charge_stream_pid: nil,
               last_charge_stream_at: nil,
+              # charge_watch_pid: Dauer-Abonnent auf `DetailedChargeState`, der - anders als
+              # charge_stream_pid - ueber ALLE Zustaende lebt. Er existiert nur, um einen
+              # Ladebeginn zu bemerken, waehrend die Aufzeichnung suspendiert ist; dort ignoriert
+              # die FSM ein {:online, %Vehicle{}} bewusst, und der Fahr-Feed triggert auf
+              # `Location`, die ein parkendes Auto nie sendet. Ohne ihn blieb eine im Stand
+              # beginnende Ladung bis zum Ende des Suspend-Fensters unerfasst (gemessen
+              # 2026-08-03: 11 min, 1,80 kWh).
+              charge_watch_pid: nil,
               # pre_online_check tracks whether an apparent online event is a real wakeup or a brief
               # subsystem check. Some vehicles (especially MCU2-upgraded cars) wake briefly (~2-3 min)
               # each hour for subsystem checks and report online, but requesting vehicle_data causes a
@@ -272,6 +280,9 @@ defmodule TeslaMate.Vehicles.Vehicle do
     end
 
     :ok = call(deps.settings, :subscribe_to_changes, [car])
+
+    # Dauer-Abonnent: lebt ueber alle Zustaende, deshalb hier statt in einem State-Uebergang.
+    data = %Data{data | charge_watch_pid: charge_watch_connect(data)}
 
     {:ok, :start, data, {:next_event, :internal, :fetch}}
   end
@@ -925,6 +936,38 @@ defmodule TeslaMate.Vehicles.Vehicle do
   # Charge-Snapshot ausserhalb von {:charging} (z.B. Rest-Snapshot nach Ende): ignorieren.
   # Der Lade-START bleibt bewusst poll-getrieben (Design); Task 7 ergaenzt die Start-Beschleunigung.
   def handle_event(:info, {:stream_charge, _payload}, _state, _data) do
+    :keep_state_and_data
+  end
+
+  #### Ladewaechter (opt-in, FLEET_TELEMETRY_CHARGE_WATCH)
+
+  # Meldet der Feed einen Ladebeginn, waehrend suspendiert ist, verlassen wir den Suspend wie
+  # `resume_logging` es tut: zurueck in prev_state + ein Fetch. Der Umweg ueber :fetch_state
+  # (wie beim {:stream, :inactive}-Pfad) wuerde NICHT genuegen - der fragt nur den kostenlosen
+  # Zustands-Endpunkt ab, und ein "online" wird im Suspend bewusst ignoriert (Handler oben).
+  # Kosten: genau EIN vehicle_data-Poll pro echtem Ladebeginn.
+  #
+  # `last_used` wird mitgesetzt, damit try_to_suspend nicht sofort wieder zuschlaegt; eine
+  # echte Ladung fuehrt ohnehin in {:charging, _}, wo nicht suspendiert wird.
+  def handle_event(:info, {:charge_watch, raw}, {:suspended, prev_state}, %Data{} = data)
+      when is_binary(raw) do
+    if Mapper.charge_phase(raw) in ["starting", "charging"] do
+      Logger.info("Charge watch: #{raw} while suspended - resuming logging",
+        car_id: data.car.id
+      )
+
+      {:next_state, prev_state,
+       %Data{data | last_state_change: DateTime.utc_now(), last_used: DateTime.utc_now()},
+       [broadcast_summary(), schedule_fetch(1, data)]}
+    else
+      :keep_state_and_data
+    end
+  end
+
+  # In allen anderen Zustaenden ist nichts zu tun: {:charging, _} laeuft schon, :online pollt
+  # regulaer, und im Schlaf faengt der kostenlose 30-s-Wach-Check den Ladebeginn (gemessen
+  # 2026-08-03: 30,7 s). Faengt auch das :fleet_streaming-Freshness-Signal des Providers ab.
+  def handle_event(:info, {:charge_watch, _payload}, _state, _data) do
     :keep_state_and_data
   end
 
@@ -2285,6 +2328,46 @@ defmodule TeslaMate.Vehicles.Vehicle do
   end
 
   def fleet_charge_feed_enabled?(_), do: false
+
+  # Eigener Flag, strikt opt-in wie die anderen Feed-Stufen. Absichtlich unabhaengig von
+  # FLEET_TELEMETRY_FEED_CHARGING: der Waechter nuetzt auch ohne Live-Lade-Feed.
+  @doc false
+  def charge_watch_enabled?(%Data{car: %Car{vin: vin}}) do
+    System.get_env("FLEET_TELEMETRY_CHARGE_WATCH") == "true" and
+      is_binary(vin) and vin == System.get_env("FLEET_TELEMETRY_VIN")
+  end
+
+  def charge_watch_enabled?(_), do: false
+
+  # Kein Warm-up-Gate und keine Alternativgruppen: der Waechter will das FRUEHESTE Signal,
+  # nicht ein vollstaendiges. Stall-Timer praktisch aus, er hat keine Freshness-Semantik.
+  defp charge_watch_connect(%Data{car: car} = data) do
+    if charge_watch_enabled?(data) do
+      Logger.info("Charge watch connecting ...", car_id: car.id)
+      me = self()
+
+      case StreamProvider.start_link(
+             car_id: car.id,
+             vin: car.vin,
+             receiver: fn payload -> send(me, {:charge_watch, payload}) end,
+             trigger_field: "DetailedChargeState",
+             map_fun: fn fields, _now -> Map.get(fields, "DetailedChargeState") end,
+             label: "Charge watch",
+             stall_ms: :timer.hours(24),
+             host: System.get_env("MQTT_HOST", "localhost"),
+             port: System.get_env("MQTT_PORT", "1883") |> String.to_integer()
+           ) do
+        {:ok, pid} ->
+          pid
+
+        error ->
+          Logger.warning("Charge watch connect failed: #{inspect(error)}", car_id: car.id)
+          nil
+      end
+    else
+      nil
+    end
+  end
 
   defp charge_streaming?(%Data{charge_stream_pid: pid}), do: is_pid(pid) and Process.alive?(pid)
 
