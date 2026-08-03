@@ -339,6 +339,53 @@ defmodule TeslaMate.Vehicles.Vehicle.ChargingTest do
       assert merged.climate_state.inside_temp == 22.0
     end
 
+    test "ein nil aus dem Feed loescht die gepollten Ranges nicht" do
+      # Sessionbeginn: der Feed hat IdealBatteryRange/RatedRange noch nicht geliefert.
+      # ideal_battery_range_km steht in Charge.changeset unter validate_required - wuerde
+      # der Merge den gepollten Wert mit nil ueberschreiben, verwirft insert_charge die
+      # ganze Kurvenzeile.
+      vehicle = %TeslaApi.Vehicle{
+        charge_state: %TeslaApi.Vehicle.State.Charge{
+          charging_state: "Charging",
+          ideal_battery_range: 185.0,
+          battery_range: 186.0,
+          timestamp: 1000
+        }
+      }
+
+      cs = %TeslaMate.FleetTelemetry.ChargeStream{
+        time: ~U[2026-08-03 12:56:17Z],
+        charging_state: "DetailedChargeStateCharging",
+        charger_power: 11,
+        ideal_battery_range_km: nil,
+        rated_battery_range_km: nil
+      }
+
+      merged = TeslaMate.Vehicles.Vehicle.merge_charge(vehicle, cs, time: true)
+
+      assert merged.charge_state.ideal_battery_range == 185.0
+      assert merged.charge_state.battery_range == 186.0
+      # der Rest kommt weiter aus dem Feed
+      assert merged.charge_state.charger_power == 11
+      assert merged.charge_state.charging_state == "DetailedChargeStateCharging"
+    end
+
+    test "ein Wert aus dem Feed gewinnt gegen den gepollten" do
+      vehicle = %TeslaApi.Vehicle{
+        charge_state: %TeslaApi.Vehicle.State.Charge{ideal_battery_range: 1.0, battery_range: 1.0}
+      }
+
+      cs = %TeslaMate.FleetTelemetry.ChargeStream{
+        time: ~U[2026-08-03 12:56:17Z],
+        ideal_battery_range_km: 297.7,
+        rated_battery_range_km: 297.7
+      }
+
+      merged = TeslaMate.Vehicles.Vehicle.merge_charge(vehicle, cs)
+      assert_in_delta merged.charge_state.ideal_battery_range, 185.0, 0.5
+      assert_in_delta merged.charge_state.battery_range, 185.0, 0.5
+    end
+
     test "ohne opts[:time] bleibt der bestehende timestamp erhalten" do
       vehicle = %TeslaApi.Vehicle{
         charge_state: %TeslaApi.Vehicle.State.Charge{timestamp: 1000, battery_level: 50}

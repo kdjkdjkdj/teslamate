@@ -357,7 +357,7 @@ defmodule TeslaMate.Vehicles.Vehicle do
       {:ok, _pos} = call(data.deps.log, :insert_position, [car, create_position(vehicle, data)])
 
       suspend_min =
-        case {data.car.settings, streaming?(data)} do
+        case {data.car.settings, stream_reliable_for_suspend?(data)} do
           {%CarSettings{use_streaming_api: true}, true} -> 30
           {%CarSettings{suspend_min: s}, _} -> s
         end
@@ -1239,6 +1239,10 @@ defmodule TeslaMate.Vehicles.Vehicle do
          }, [broadcast_summary(), schedule_fetch(5, data), schedule_position_storing()]}
 
       _ ->
+        # Kilometerstand in den Live-Feed zuruecklegen, bevor ueber Suspend entschieden wird
+        # (siehe seed_fleet_odometer/2). No-op ohne aktiven Fleet-Feed.
+        seed_fleet_odometer(data, vehicle)
+
         try_to_suspend(vehicle, state, data)
     end
   end
@@ -1848,7 +1852,7 @@ defmodule TeslaMate.Vehicles.Vehicle do
 
   defp try_to_suspend(vehicle, current_state, %Data{car: car} = data) do
     {suspend_after_idle_min, suspend_min, i} =
-      case {car.settings, streaming?(data)} do
+      case {car.settings, stream_reliable_for_suspend?(data)} do
         {%CarSettings{use_streaming_api: true}, true} -> {3, 30, 2}
         {%CarSettings{suspend_after_idle_min: i, suspend_min: s}, _} -> {i, s, 1}
       end
@@ -2095,13 +2099,23 @@ defmodule TeslaMate.Vehicles.Vehicle do
             charge_energy_added: cs.charge_energy_added,
             battery_level: cs.battery_level,
             usable_battery_level: cs.usable_battery_level,
-            ideal_battery_range: Convert.km_to_miles(cs.ideal_battery_range_km, 6),
-            battery_range: Convert.km_to_miles(cs.rated_battery_range_km, 6),
+            ideal_battery_range:
+              keep(Convert.km_to_miles(cs.ideal_battery_range_km, 6), charge.ideal_battery_range),
+            battery_range:
+              keep(Convert.km_to_miles(cs.rated_battery_range_km, 6), charge.battery_range),
             fast_charger_present: cs.fast_charger_present,
             fast_charger_type: cs.fast_charger_type
         }
     }
   end
+
+  # Ein `nil` aus dem Feed heisst "noch nicht geliefert", nicht "auf null gefallen". Fuer die
+  # Ranges darf es den letzten gepollten Wert deshalb nicht loeschen: `ideal_battery_range_km`
+  # steht in Charge.changeset unter validate_required, eine Zeile ohne ihn wird komplett
+  # verworfen. Damit wird auch der Warm-up-Timeout-Zweig brauchbar, statt eine Zeile zu
+  # erzeugen, die insert_charge wegwirft.
+  defp keep(nil, previous), do: previous
+  defp keep(value, _previous), do: value
 
   defp put_charge_defaults(vehicle) do
     charge_state =
@@ -2183,6 +2197,21 @@ defmodule TeslaMate.Vehicles.Vehicle do
 
   defp fleet_stream_active?(_), do: false
 
+  # Fuer die Suspend-Entscheidung zaehlt nicht, ob der Provider-Prozess lebt, sondern ob er
+  # liefert. `streaming?/1` prueft nur `Process.alive?` - und der Fleet-Provider ueberlebt
+  # einen Stall absichtlich (siehe StreamProvider-@moduledoc). Damit war `streaming?` bei
+  # aktivem Feed dauerhaft wahr: TeslaMate suspendierte nach 3 min fuer 30 min im Vertrauen
+  # auf einen Stream, der im Stand nichts sendet - der Fahr-Feed triggert auf `Location`, und
+  # ein parkendes Auto liefert keine. Eine im Stand beginnende Ladung blieb so bis zu 30 min
+  # unerfasst (gemessen 2026-08-03: 11 min Heimladung). Ohne Fleet-Feed unveraendert.
+  defp stream_reliable_for_suspend?(%Data{} = data) do
+    if fleet_feed_enabled?(data) do
+      fleet_stream_active?(data)
+    else
+      streaming?(data)
+    end
+  end
+
   # Charge-Feed-Gegenstuecke zu fleet_feed_enabled?/fleet_stream_active?. Eigener Flag
   # (FLEET_TELEMETRY_FEED_CHARGING), strikt opt-in und unabhaengig vom Fahr-Feed.
   @doc false
@@ -2237,6 +2266,26 @@ defmodule TeslaMate.Vehicles.Vehicle do
   end
 
   def seed_fleet_gear(%Data{}, _shift_state), do: :ok
+
+  # Gegenstueck zu seed_fleet_gear fuer den Kilometerstand. `Odometer` kommt onChange: im
+  # Stand aendert er sich nicht, erreicht den frischen Provider-FieldState also nie, das
+  # Warm-up-Gate laeuft in den Timeout und die erste Position einer Fahrt hat odometer=nil
+  # -> drives.start_km NULL -> distance NULL (7 von 161 Fahrten, gemessen 2026-08-03).
+  # Henne-Ei: der Wert fliesst erst beim Fahren, gebraucht wird er im Moment des Losfahrens.
+  # Einheit: Feed und vehicle_state.odometer sind beide in Meilen (create_position rechnet
+  # erst danach um) -> direkt uebernehmbar. Rein additiv; ein echtes Odometer-Event
+  # ueberschreibt den Seed.
+  @doc false
+  def seed_fleet_odometer(
+        %Data{stream_pid: pid} = data,
+        %Vehicle{vehicle_state: %VehicleState{odometer: odo}}
+      )
+      when is_pid(pid) and is_number(odo) do
+    if fleet_feed_enabled?(data), do: StreamProvider.ingest(pid, "Odometer", odo)
+    :ok
+  end
+
+  def seed_fleet_odometer(%Data{}, _vehicle), do: :ok
 
   # Charge-Feed-Gegenstueck zu seed_fleet_gear: speist den zuletzt gepollten charging_state als
   # DetailedChargeState-Rohwert in den laufenden ChargeStreamProvider. Grund: Fleet sendet
