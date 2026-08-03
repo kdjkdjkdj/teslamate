@@ -34,6 +34,54 @@ defmodule TeslaMate.Vehicles.Vehicle.StreamingTest do
               colors: [enabled: false]
 
     @tag :capture_log
+    test "zwei nil-Odometer hintereinander loeschen die Fallback-Quelle nicht",
+         %{test: name} do
+      # Reihenfolge im Fahr-Handler: create_position/2 zieht den Odometer notfalls aus
+      # last_response, DANACH schreibt merge/3 last_response fort. Setzte merge/3 den
+      # Odometer bedingungslos, raeumte das ERSTE nil-Event die Quelle leer und das ZWEITE
+      # schrieb eine Position ohne Odometer (gemessen 2026-08-03, Fahrt 170, Position 17507).
+      me = self()
+      now = DateTime.utc_now()
+      now_ts = DateTime.to_unix(now, :millisecond)
+      vs = %{timestamp: now_ts, car_version: "", odometer: 2000}
+
+      events = [
+        {:ok, online_event(now_ts, vehicle_state: vs)},
+        {:ok, online_event(now_ts, drive_state: %{timestamp: now_ts}, vehicle_state: vs)},
+        fn ->
+          send(me, :continue?)
+
+          receive do
+            :continue -> {:error, :closed}
+          after
+            5_000 -> raise "No :continue after 5s"
+          end
+        end,
+        fn -> Process.sleep(10_000) end
+      ]
+
+      :ok = start_vehicle(name, events)
+
+      assert_receive {:start_state, car, :online, date: _}
+      assert_receive {:insert_position, ^car, %{}}
+      assert_receive {ApiMock, {:stream, _eid, func}} when is_function(func)
+      assert_receive :continue?
+
+      stream(name, %{shift_state: "D", speed: 10, odometer: 3000, time: now})
+      assert_receive {:start_drive, ^car}
+      assert_receive {:insert_position, drive, p1}
+      assert_in_delta p1.odometer, 4828.032, 0.01
+
+      stream(name, %{shift_state: "D", speed: 11, odometer: nil, time: now})
+      assert_receive {:insert_position, ^drive, p2}
+      assert_in_delta p2.odometer, 4828.032, 0.01
+
+      stream(name, %{shift_state: "D", speed: 12, odometer: nil, time: now})
+      assert_receive {:insert_position, ^drive, p3}
+      assert_in_delta p3.odometer, 4828.032, 0.01
+    end
+
+    @tag :capture_log
     test "Fahrtstart ohne Odometer im Payload faellt auf den letzten Poll zurueck",
          %{test: name} do
       # `Odometer` kommt onChange und aendert sich im Stand nicht, kann beim ersten

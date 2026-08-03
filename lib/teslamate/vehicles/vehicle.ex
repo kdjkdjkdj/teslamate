@@ -1527,6 +1527,14 @@ defmodule TeslaMate.Vehicles.Vehicle do
         # entgangen ist (siehe seed_fleet_gear/2). No-op ohne aktiven Fleet-Feed.
         seed_fleet_gear(data, shift_state)
 
+        # Und mit dem Kilometerstand - aus demselben Grund. ⚠️ Der Seed im
+        # :online/:suspended-Handler genuegt NICHT: waeht das Auto direkt in eine Fahrt auf
+        # (offline -> {:driving, _}, ohne Online-Leerlauf), lief er nie, und der frische
+        # Provider-FieldState bleibt ohne Odometer. Gemessen 2026-08-03: Auto offline bis
+        # 18:04:03, Fahrtbeginn im selben Moment -> Gate lief in den Timeout und schrieb eine
+        # Position ohne Odometer. Hier greift es, weil waehrend {:driving, _} gepollt wird.
+        seed_fleet_odometer(data, vehicle)
+
         {:keep_state, %{data | last_used: DateTime.utc_now(), geofence: geofence},
          [broadcast_summary(), schedule_fetch(interval, data)]}
 
@@ -2117,7 +2125,13 @@ defmodule TeslaMate.Vehicles.Vehicle do
         },
         vehicle_state: %{
           vehicle.vehicle_state
-          | odometer: stream_data.odometer
+          # ⚠️ NICHT bedingungslos setzen. `last_response` ist die Fallback-Quelle, aus der
+          # create_position/2 den Odometer zieht, wenn der Feed keinen liefert. Ein
+          # durchgeschriebenes nil loescht genau diese Quelle - der Fallback entzieht sich
+          # selbst die Grundlage. Gemessen 2026-08-03 an Fahrt 170: nach dem degradierten
+          # Warm-up-Emit war last_response.odometer nil, Position 17507 blieb ohne.
+          # Gefahrlos, weil der Odometer monoton ist (vgl. create_position/2).
+          | odometer: keep(stream_data.odometer, vehicle.vehicle_state.odometer)
         }
     }
   end
