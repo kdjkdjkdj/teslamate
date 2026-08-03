@@ -139,6 +139,75 @@ defmodule TeslaMate.FleetTelemetry.StreamProviderTest do
     end
   end
 
+  describe "Warm-up-Gate (require_fields)" do
+    test "ohne require_fields wird sofort emittiert (Default unveraendert)" do
+      pid = start([])
+      StreamProvider.ingest(pid, "Location", %{"latitude" => 1.0, "longitude" => 2.0})
+      assert_receive {:stream, %StreamData{odometer: nil}}, 200
+    end
+
+    test "haelt den ersten Emit zurueck, bis das Pflichtfeld da ist" do
+      pid = start(require_fields: ["Odometer"])
+
+      StreamProvider.ingest(pid, "Location", %{"latitude" => 1.0, "longitude" => 2.0})
+      refute_receive {:stream, _}, 100
+
+      StreamProvider.ingest(pid, "Odometer", 64_000.5)
+      # Odometer ist kein Trigger -> erst der naechste Location-Event emittiert
+      refute_receive {:stream, _}, 50
+
+      StreamProvider.ingest(pid, "Location", %{"latitude" => 3.0, "longitude" => 4.0})
+      assert_receive {:stream, %StreamData{est_lat: 3.0, odometer: 64_000.5}}, 200
+    end
+
+    test "nach dem ersten Emit greift der Gate nicht mehr" do
+      pid = start(require_fields: ["Odometer"])
+      StreamProvider.ingest(pid, "Odometer", 1.0)
+      StreamProvider.ingest(pid, "Location", %{"latitude" => 1.0, "longitude" => 2.0})
+      assert_receive {:stream, %StreamData{}}, 200
+      assert_receive {:stream, :fleet_streaming}, 200
+
+      StreamProvider.ingest(pid, "Location", %{"latitude" => 5.0, "longitude" => 6.0})
+      assert_receive {:stream, %StreamData{est_lat: 5.0}}, 200
+    end
+
+    test "emittiert nach Ablauf von warmup_ms auch ohne Pflichtfeld (degraded statt stumm)" do
+      pid = start(require_fields: ["Odometer"], warmup_ms: 60)
+
+      StreamProvider.ingest(pid, "Location", %{"latitude" => 1.0, "longitude" => 2.0})
+      refute_receive {:stream, _}, 100
+
+      StreamProvider.ingest(pid, "Location", %{"latitude" => 7.0, "longitude" => 8.0})
+      assert_receive {:stream, %StreamData{est_lat: 7.0, odometer: nil}}, 200
+    end
+
+    test "emit_always laesst das Ereignis trotz fehlendem Pflichtfeld sofort durch" do
+      me = self()
+
+      {:ok, pid} =
+        StreamProvider.start_link(
+          car_id: 1,
+          vin: "V",
+          connect?: false,
+          receiver: fn x -> send(me, {:got, x}) end,
+          trigger_field: "DetailedChargeState",
+          map_fun: fn fields, _now -> {:charge, Map.get(fields, "DetailedChargeState")} end,
+          require_fields: ["IdealBatteryRange"],
+          emit_always: fn field, value ->
+            field == "DetailedChargeState" and String.contains?(value, "Stopped")
+          end
+        )
+
+      # laufende Ladung ohne Pflichtfeld -> zurueckgehalten
+      StreamProvider.ingest(pid, "DetailedChargeState", "DetailedChargeStateCharging")
+      refute_receive {:got, _}, 100
+
+      # Lade-ENDE -> muss durch, sonst bleibt der charging_process offen
+      StreamProvider.ingest(pid, "DetailedChargeState", "DetailedChargeStateStopped")
+      assert_receive {:got, {:charge, "DetailedChargeStateStopped"}}, 200
+    end
+  end
+
   describe "fleet_driving_interval" do
     test "default 180s" do
       assert TeslaMate.Vehicles.Vehicle.fleet_driving_interval() == 180

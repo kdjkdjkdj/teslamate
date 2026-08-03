@@ -2268,6 +2268,9 @@ defmodule TeslaMate.Vehicles.Vehicle do
         car_id: car.id,
         vin: car.vin,
         receiver: fn stream_data -> send(me, {:stream, stream_data}) end,
+        # Ohne Odometer waere die erste Position eine Fahrt ohne start_km (-> distance NULL).
+        require_fields: ["Odometer"],
+        warmup_ms: interval("FLEET_TELEMETRY_WARMUP_S", 60) * 1000,
         host: System.get_env("MQTT_HOST", "localhost"),
         port: System.get_env("MQTT_PORT", "1883") |> String.to_integer(),
         stall_ms: interval("FLEET_TELEMETRY_STALL_S", 90) * 1000
@@ -2317,6 +2320,11 @@ defmodule TeslaMate.Vehicles.Vehicle do
              receiver: fn payload -> send(me, {:stream_charge, payload}) end,
              trigger_field: ["DetailedChargeState", "DCChargingEnergyIn", "ACChargingEnergyIn"],
              map_fun: &Mapper.to_charge_stream/2,
+             # insert_charge verlangt ideal_battery_range_km; fehlt es, faellt die ganze
+             # Kurvenzeile weg. Das Lade-ENDE darf der Gate aber nie zurueckhalten.
+             require_fields: ["IdealBatteryRange"],
+             warmup_ms: interval("FLEET_TELEMETRY_WARMUP_S", 60) * 1000,
+             emit_always: &terminal_charge_field?/2,
              host: System.get_env("MQTT_HOST", "localhost"),
              port: System.get_env("MQTT_PORT", "1883") |> String.to_integer(),
              stall_ms: interval("FLEET_TELEMETRY_STALL_S", 90) * 1000
@@ -2332,6 +2340,14 @@ defmodule TeslaMate.Vehicles.Vehicle do
       nil
     end
   end
+
+  # Ausnahme vom Warm-up-Gate des Lade-Feeds: die Stopped/Complete-Kante schliesst den
+  # charging_process ab und darf nicht warten, auch wenn IdealBatteryRange noch fehlt.
+  defp terminal_charge_field?("DetailedChargeState", raw) do
+    Mapper.charge_phase(raw) in ["stopped", "complete"]
+  end
+
+  defp terminal_charge_field?(_field, _value), do: false
 
   defp disconnect_charge_stream(%Data{charge_stream_pid: nil}), do: :ok
 

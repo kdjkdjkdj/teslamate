@@ -21,6 +21,16 @@ defmodule TeslaMate.FleetTelemetry.StreamProvider do
   und riss ueber den Link den Vehicle-FSM mit -> Crash-Schleife bei jedem Lade-/
   Online-Uebergang. Connect-Fehler werden jetzt tolerant behandelt (degraded statt
   Crash).
+
+  Warm-up-Gate (`require_fields`): Eine Session beginnt nicht mit allen Feldern -
+  Fleet sendet on-change mit Mindestabstand, ein Payload traegt im Schnitt 48,5 von
+  59 Feldern. Emittiert der Provider schon auf den ersten Trigger, entsteht eine
+  halbleere Startzeile, die stromabwaerts Schaden anrichtet (Position ohne Odometer
+  -> `drives.start_km` NULL -> `distance` NULL; Ladezeile ohne IdealBatteryRange ->
+  von `insert_charge` verworfen). Der Gate haelt den Emit deshalb zurueck, bis die
+  konfigurierten Pflichtfelder einmal da waren - danach nie wieder, weil FieldState
+  sie forttraegt. Zwei Sicherungen gegen Verstummen: nach `warmup_ms` wird trotzdem
+  emittiert, und `emit_always` laesst definierte Ereignisse (Lade-Ende) sofort durch.
   """
   use GenServer
   require Logger
@@ -29,6 +39,7 @@ defmodule TeslaMate.FleetTelemetry.StreamProvider do
   alias Tortoise311.Transport
 
   @stall_ms 90_000
+  @warmup_ms 60_000
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts)
 
@@ -57,6 +68,15 @@ defmodule TeslaMate.FleetTelemetry.StreamProvider do
       # und wird so ueber denselben Provider (client_id/terminate/Stall/connect) wiederverwendet.
       map_fun: Keyword.get(opts, :map_fun, &Mapper.to_stream_data/2),
       stall_ms: Keyword.get(opts, :stall_ms, @stall_ms),
+      # Warm-up-Gate (siehe @moduledoc): Felder, die vor dem ERSTEN Emit dagewesen
+      # sein muessen. Leer = Gate aus (Default, Verhalten unveraendert).
+      require_fields: Keyword.get(opts, :require_fields, []),
+      warmup_ms: Keyword.get(opts, :warmup_ms, @warmup_ms),
+      # Ausnahme vom Gate: (field, value) -> true erzwingt den Emit auch im Warm-up.
+      # Der Lade-Feed laesst so die Stopped/Complete-Kante immer durch.
+      emit_always: Keyword.get(opts, :emit_always, fn _field, _value -> false end),
+      warmup?: true,
+      started_at: DateTime.utc_now(),
       streaming?: false,
       timer: nil,
       client_id: nil
@@ -79,20 +99,35 @@ defmodule TeslaMate.FleetTelemetry.StreamProvider do
     st = %{st | state: fs}
 
     st =
-      if FieldState.trigger?(fs, field) do
-        sd = st.map_fun.(FieldState.fields(fs), now)
-        # Stream-Daten zuerst, dann das Freshness-Signal: so bleibt die
-        # Objekt-Reihenfolge fuer den FSM eindeutig.
-        safe_emit(st.receiver, sd)
-        safe_emit(st.receiver, :fleet_streaming)
+      cond do
+        not FieldState.trigger?(fs, field) ->
+          st
 
-        if not st.streaming? do
-          Logger.info("FleetTelemetry stream active - feeding live positions")
-        end
+        not emit?(st, fs, field, value, now) ->
+          Logger.debug(
+            "FleetTelemetry warm-up: emit zurueckgehalten, fehlt noch #{inspect(missing(st, fs))}"
+          )
 
-        arm_timer(%{st | streaming?: true})
-      else
-        st
+          st
+
+        true ->
+          if st.warmup? and missing(st, fs) != [] do
+            Logger.info(
+              "FleetTelemetry warm-up beendet ohne #{inspect(missing(st, fs))} - emittiere degraded"
+            )
+          end
+
+          sd = st.map_fun.(FieldState.fields(fs), now)
+          # Stream-Daten zuerst, dann das Freshness-Signal: so bleibt die
+          # Objekt-Reihenfolge fuer den FSM eindeutig.
+          safe_emit(st.receiver, sd)
+          safe_emit(st.receiver, :fleet_streaming)
+
+          if not st.streaming? do
+            Logger.info("FleetTelemetry stream active - feeding live positions")
+          end
+
+          arm_timer(%{st | streaming?: true, warmup?: false})
       end
 
     {:noreply, st}
@@ -126,6 +161,27 @@ defmodule TeslaMate.FleetTelemetry.StreamProvider do
   end
 
   def terminate(_reason, _st), do: :ok
+
+  # Warm-up-Gate: Fleet liefert die Felder einer Session nicht atomar (Payloads tragen
+  # im Schnitt 48,5 von 59 Feldern). Trifft der Trigger, bevor ein Pflichtfeld je
+  # gesehen wurde, entsteht eine halbleere Startzeile: beim Fahr-Feed eine Position
+  # ohne Odometer (-> drives.start_km NULL -> distance NULL), beim Lade-Feed eine
+  # Zeile ohne IdealBatteryRange (-> von insert_charge komplett verworfen).
+  # Der Gate haelt nur bis zum ersten Emit zurueck - danach traegt FieldState die
+  # Felder fort, und ein spaeter fehlendes Feld ist eine echte Aussage, kein Warm-up.
+  # Nach warmup_ms wird trotzdem emittiert: lieber degraded als stumm.
+  defp emit?(%{warmup?: false}, _fs, _field, _value, _now), do: true
+  defp emit?(%{require_fields: []}, _fs, _field, _value, _now), do: true
+
+  defp emit?(%{} = st, fs, field, value, now) do
+    st.emit_always.(field, value) or
+      missing(st, fs) == [] or
+      DateTime.diff(now, st.started_at, :millisecond) >= st.warmup_ms
+  end
+
+  defp missing(%{require_fields: req}, fs) do
+    Enum.filter(req, &is_nil(FieldState.get(fs, &1)))
+  end
 
   defp arm_timer(%{timer: t, stall_ms: ms} = st) do
     if is_reference(t), do: Process.cancel_timer(t)
