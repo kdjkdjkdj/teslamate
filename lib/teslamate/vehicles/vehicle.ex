@@ -894,7 +894,13 @@ defmodule TeslaMate.Vehicles.Vehicle do
 
         {:ok, _} =
           Repo.transaction(fn ->
-            :ok = insert_charge(cproc, vehicle, data)
+            # terminal?: Die Stopped/Complete-Kante darf der Warm-up-Gate nie zurueckhalten
+            # (sonst bliebe der charging_process offen) und kann deshalb ohne
+            # charge_energy_added ankommen. Dass diese Kurvenzeile dann verworfen wird, ist
+            # GEWOLLT - fortschreiben wuerde den Zaehler der vorigen Ladung einschleppen,
+            # siehe die Begruendung bei keep/2. Es ist also kein Fehler und wird ab hier
+            # auch nicht mehr als einer geloggt: Endsignal und Kurvenzeile sind getrennt.
+            :ok = insert_charge(cproc, vehicle, data, terminal?: true)
 
             {:ok, %Log.ChargingProcess{duration_min: duration, charge_energy_added: added}} =
               call(data.deps.log, :complete_charging_process, [cproc])
@@ -1874,7 +1880,7 @@ defmodule TeslaMate.Vehicles.Vehicle do
 
   defp last_odometer(_data), do: nil
 
-  defp insert_charge(charging_process, %Vehicle{} = vehicle, data) do
+  defp insert_charge(charging_process, %Vehicle{} = vehicle, data, opts \\ []) do
     attrs = %{
       date: parse_timestamp(vehicle.charge_state.timestamp),
       battery_heater_on: vehicle.charge_state.battery_heater_on,
@@ -1907,9 +1913,17 @@ defmodule TeslaMate.Vehicles.Vehicle do
             end)
           end)
 
-        Logger.warning("Invalid charge data: #{inspect(errors, pretty: true)}",
-          car_id: data.car.id
-        )
+        if Keyword.get(opts, :terminal?, false) do
+          Logger.info(
+            "Lade-Ende ohne vollstaendige Kurvenfelder - Endsignal verarbeitet, " <>
+              "keine Kurvenzeile: #{inspect(errors, pretty: true)}",
+            car_id: data.car.id
+          )
+        else
+          Logger.warning("Invalid charge data: #{inspect(errors, pretty: true)}",
+            car_id: data.car.id
+          )
+        end
 
       {:ok, _charge} ->
         :ok

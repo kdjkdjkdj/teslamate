@@ -130,8 +130,20 @@ defmodule TeslaMate.FleetTelemetry.StreamProvider do
 
         true ->
           if st.warmup? and missing(st, fs) != [] do
+            # Der Grund gehoert in die Zeile. Die alte Fassung nannte immer "warm-up beendet"
+            # und liess damit den Timeout als Ursache erscheinen, auch wenn in Wahrheit die
+            # emit_always-Ausnahme gefeuert hatte. Am 04.08.2026 hat genau das eine
+            # Fehlersuche in die falsche Richtung geschickt: der degradierte Emit kam 27,8 s
+            # nach Provider-Start, das Fenster sind 60 s - es war nie der Timeout.
+            grund =
+              if st.emit_always.(field, value) do
+                "Ausnahme emit_always"
+              else
+                "Timeout #{st.warmup_ms} ms"
+              end
+
             Logger.info(
-              "FleetTelemetry warm-up beendet ohne #{inspect(missing(st, fs))} - emittiere degraded"
+              "FleetTelemetry warm-up beendet ohne #{inspect(missing(st, fs))} - emittiere degraded (#{grund})"
             )
           end
 

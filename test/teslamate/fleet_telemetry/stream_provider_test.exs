@@ -326,6 +326,58 @@ defmodule TeslaMate.FleetTelemetry.StreamProviderTest do
     end
   end
 
+  describe "Grund im degradierten Emit" do
+    # config/test.exs setzt `level: :warning` - die Info-Zeile wird sonst gefiltert, bevor
+    # capture_log sie sieht. Nur fuer diesen Block angehoben und danach zurueckgestellt.
+    setup do
+      vorher = Logger.level()
+      Logger.configure(level: :info)
+      on_exit(fn -> Logger.configure(level: vorher) end)
+      :ok
+    end
+
+    test "der Timeout wird als Timeout benannt" do
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          pid = start(require_fields: ["Odometer"], warmup_ms: 40)
+          StreamProvider.ingest(pid, "Location", %{"latitude" => 1.0, "longitude" => 2.0})
+          refute_receive {:stream, _}, 80
+          StreamProvider.ingest(pid, "Location", %{"latitude" => 7.0, "longitude" => 8.0})
+          assert_receive {:stream, %StreamData{est_lat: 7.0}}, 200
+        end)
+
+      assert log =~ "emittiere degraded (Timeout"
+      refute log =~ "emit_always"
+    end
+
+    test "die emit_always-Ausnahme wird als Ausnahme benannt, nicht als Timeout" do
+      me = self()
+
+      log =
+        ExUnit.CaptureLog.capture_log(fn ->
+          {:ok, pid} =
+            StreamProvider.start_link(
+              car_id: 1,
+              vin: "V",
+              connect?: false,
+              receiver: fn x -> send(me, {:got, x}) end,
+              trigger_field: "DetailedChargeState",
+              map_fun: fn fields, _now -> {:charge, Map.get(fields, "DetailedChargeState")} end,
+              require_hard: ["IdealBatteryRange"],
+              emit_always: fn field, value ->
+                field == "DetailedChargeState" and String.contains?(value, "Stopped")
+              end
+            )
+
+          StreamProvider.ingest(pid, "DetailedChargeState", "DetailedChargeStateStopped")
+          assert_receive {:got, _}, 200
+        end)
+
+      assert log =~ "emittiere degraded (Ausnahme emit_always)"
+      refute log =~ "(Timeout"
+    end
+  end
+
   describe "fleet_driving_interval" do
     test "default 180s" do
       assert TeslaMate.Vehicles.Vehicle.fleet_driving_interval() == 180
