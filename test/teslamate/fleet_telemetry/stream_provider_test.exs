@@ -241,6 +241,91 @@ defmodule TeslaMate.FleetTelemetry.StreamProviderTest do
     end
   end
 
+  describe "Harte Pflichtfelder (require_hard) - kein Timeout-Bypass" do
+    test "der warmup_ms-Timeout ueberbrueckt ein hartes Pflichtfeld NICHT" do
+      pid = start(require_hard: ["IdealBatteryRange"], warmup_ms: 40)
+
+      StreamProvider.ingest(pid, "Location", %{"latitude" => 1.0, "longitude" => 2.0})
+      refute_receive {:stream, _}, 100
+
+      # nach Ablauf des Fensters weiterhin still - anders als bei require_fields
+      StreamProvider.ingest(pid, "Location", %{"latitude" => 7.0, "longitude" => 8.0})
+      refute_receive {:stream, _}, 100
+    end
+
+    test "sobald das harte Feld da ist, oeffnet der Gate" do
+      pid = start(require_hard: ["IdealBatteryRange"], warmup_ms: 40)
+
+      StreamProvider.ingest(pid, "Location", %{"latitude" => 1.0, "longitude" => 2.0})
+      refute_receive {:stream, _}, 100
+
+      StreamProvider.ingest(pid, "IdealBatteryRange", 115.07)
+      StreamProvider.ingest(pid, "Location", %{"latitude" => 3.0, "longitude" => 4.0})
+      assert_receive {:stream, %StreamData{est_lat: 3.0}}, 200
+    end
+
+    test "harte Alternativgruppe: eines der Felder genuegt, der Timeout ersetzt keines" do
+      pid = start(require_hard: [["DCChargingEnergyIn", "ACChargingEnergyIn"]], warmup_ms: 40)
+
+      StreamProvider.ingest(pid, "Location", %{"latitude" => 1.0, "longitude" => 2.0})
+      refute_receive {:stream, _}, 100
+
+      StreamProvider.ingest(pid, "ACChargingEnergyIn", 1.78)
+      StreamProvider.ingest(pid, "Location", %{"latitude" => 5.0, "longitude" => 6.0})
+      assert_receive {:stream, %StreamData{est_lat: 5.0}}, 200
+    end
+
+    test "weich und hart gemischt: der Timeout ueberbrueckt nur das weiche Feld" do
+      pid = start(require_fields: ["Odometer"], require_hard: ["IdealBatteryRange"], warmup_ms: 40)
+
+      StreamProvider.ingest(pid, "Location", %{"latitude" => 1.0, "longitude" => 2.0})
+      refute_receive {:stream, _}, 100
+
+      # Timeout abgelaufen, aber das harte Feld fehlt -> weiter still
+      StreamProvider.ingest(pid, "Location", %{"latitude" => 3.0, "longitude" => 4.0})
+      refute_receive {:stream, _}, 100
+
+      # nur das harte Feld nachliefern: Odometer bleibt leer, emittiert wird trotzdem
+      StreamProvider.ingest(pid, "IdealBatteryRange", 115.07)
+      StreamProvider.ingest(pid, "Location", %{"latitude" => 9.0, "longitude" => 10.0})
+      assert_receive {:stream, %StreamData{est_lat: 9.0, odometer: nil}}, 200
+    end
+
+    test "emit_always bleibt die Ausnahme auch fuer harte Felder (Lade-Ende)" do
+      me = self()
+
+      {:ok, pid} =
+        StreamProvider.start_link(
+          car_id: 1,
+          vin: "V",
+          connect?: false,
+          receiver: fn x -> send(me, {:got, x}) end,
+          trigger_field: "DetailedChargeState",
+          map_fun: fn fields, _now -> {:charge, Map.get(fields, "DetailedChargeState")} end,
+          require_hard: ["IdealBatteryRange"],
+          emit_always: fn field, value ->
+            field == "DetailedChargeState" and String.contains?(value, "Stopped")
+          end
+        )
+
+      StreamProvider.ingest(pid, "DetailedChargeState", "DetailedChargeStateCharging")
+      refute_receive {:got, _}, 100
+
+      StreamProvider.ingest(pid, "DetailedChargeState", "DetailedChargeStateStopped")
+      assert_receive {:got, {:charge, "DetailedChargeStateStopped"}}, 200
+    end
+
+    test "Default unveraendert: ohne require_hard wird der Timeout weiter genutzt" do
+      pid = start(require_fields: ["Odometer"], warmup_ms: 40)
+
+      StreamProvider.ingest(pid, "Location", %{"latitude" => 1.0, "longitude" => 2.0})
+      refute_receive {:stream, _}, 100
+
+      StreamProvider.ingest(pid, "Location", %{"latitude" => 7.0, "longitude" => 8.0})
+      assert_receive {:stream, %StreamData{est_lat: 7.0, odometer: nil}}, 200
+    end
+  end
+
   describe "fleet_driving_interval" do
     test "default 180s" do
       assert TeslaMate.Vehicles.Vehicle.fleet_driving_interval() == 180

@@ -2535,7 +2535,9 @@ defmodule TeslaMate.Vehicles.Vehicle do
              # und ideal_battery_range_km. charger_power defaultet insert_charge inline
              # (`|| 0`); die anderen zwei muessen echt da sein. Die Energie kommt als DC- ODER
              # AC-Feld -> Alternativgruppe. Das Lade-ENDE darf der Gate nie zurueckhalten.
-             require_fields: [
+             # Beide HART: ohne sie verwirft der Changeset die Kurvenzeile, ein
+             # degradierter Emit nach warmup_ms waere also garantiert fuer die Tonne.
+             require_hard: [
                "IdealBatteryRange",
                ["DCChargingEnergyIn", "ACChargingEnergyIn"]
              ],

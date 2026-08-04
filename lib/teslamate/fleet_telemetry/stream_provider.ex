@@ -32,6 +32,15 @@ defmodule TeslaMate.FleetTelemetry.StreamProvider do
   konfigurierten Pflichtfelder einmal da waren - danach nie wieder, weil FieldState
   sie forttraegt. Zwei Sicherungen gegen Verstummen: nach `warmup_ms` wird trotzdem
   emittiert, und `emit_always` laesst definierte Ereignisse (Lade-Ende) sofort durch.
+
+  `require_hard` fuer Felder, deren Fehlen die Zeile nicht aermer, sondern UNGUELTIG
+  macht (Ladezeile ohne Energie -> `charge_energy_added: can't be blank`). Sie werden
+  vom `warmup_ms`-Timeout NICHT ueberbrueckt. Ohne diese Trennung emittiert der Timeout
+  genau die halbleere Zeile, gegen die der Gate gebaut wurde - am 04.08.2026 im Feld
+  belegt: `warm-up beendet ohne [...] - emittiere degraded`, eine Millisekunde spaeter
+  `Invalid charge data`. `emit_always` bleibt bewusst auch fuer harte Felder eine
+  Ausnahme: ein verworfenes Lade-ENDE (offener charging_process) waere schlimmer als
+  eine verworfene Kurvenzeile.
   """
   use GenServer
   require Logger
@@ -74,6 +83,9 @@ defmodule TeslaMate.FleetTelemetry.StreamProvider do
       # LISTE von Alternativen sein - dann genuegt eines davon (z.B. DC- ODER AC-Energie:
       # beide zu fordern waere nie erfuellbar, DC-Laden sendet kein AC-Feld).
       require_fields: Keyword.get(opts, :require_fields, []),
+      # Harte Pflichtfelder (gleiche Form, Alternativlisten erlaubt): ihr Fehlen macht die
+      # Zeile stromabwaerts ungueltig statt nur aermer -> kein Timeout-Bypass.
+      require_hard: Keyword.get(opts, :require_hard, []),
       warmup_ms: Keyword.get(opts, :warmup_ms, @warmup_ms),
       # Ausnahme vom Gate: (field, value) -> true erzwingt den Emit auch im Warm-up.
       # Der Lade-Feed laesst so die Stopped/Complete-Kante immer durch.
@@ -175,17 +187,22 @@ defmodule TeslaMate.FleetTelemetry.StreamProvider do
   # Felder fort, und ein spaeter fehlendes Feld ist eine echte Aussage, kein Warm-up.
   # Nach warmup_ms wird trotzdem emittiert: lieber degraded als stumm.
   defp emit?(%{warmup?: false}, _fs, _field, _value, _now), do: true
-  defp emit?(%{require_fields: []}, _fs, _field, _value, _now), do: true
+  defp emit?(%{require_fields: [], require_hard: []}, _fs, _field, _value, _now), do: true
 
   defp emit?(%{} = st, fs, field, value, now) do
     st.emit_always.(field, value) or
-      missing(st, fs) == [] or
-      DateTime.diff(now, st.started_at, :millisecond) >= st.warmup_ms
+      (hard_missing(st, fs) == [] and
+         (soft_missing(st, fs) == [] or
+            DateTime.diff(now, st.started_at, :millisecond) >= st.warmup_ms))
   end
 
-  defp missing(%{require_fields: req}, fs) do
-    Enum.reject(req, &satisfied?(&1, fs))
+  # Fuer die Logzeile: alles was fehlt, weich wie hart.
+  defp missing(%{require_fields: req, require_hard: hard}, fs) do
+    Enum.reject(req ++ hard, &satisfied?(&1, fs))
   end
+
+  defp soft_missing(%{require_fields: req}, fs), do: Enum.reject(req, &satisfied?(&1, fs))
+  defp hard_missing(%{require_hard: hard}, fs), do: Enum.reject(hard, &satisfied?(&1, fs))
 
   # Alternativgruppe: eines der Felder genuegt. Einzelfeld: es selbst muss da sein.
   defp satisfied?(alternatives, fs) when is_list(alternatives) do
