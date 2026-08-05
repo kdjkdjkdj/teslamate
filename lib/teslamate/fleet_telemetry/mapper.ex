@@ -8,6 +8,18 @@ defmodule TeslaMate.FleetTelemetry.Mapper do
 
   @mi_to_km 1.609344
 
+  # Wirkungsgrad des Onboard-Chargers (AC -> DC), fuer die akkuseitige Energie bei
+  # AC-Ladung. Gemessen 2026-08-05 an Ladung #390 (92 min, 11 kW dreiphasig):
+  # DCChargingEnergyIn / ACChargingEnergyIn = 0,955; gegen den Wallbox-Zaehler
+  # (16,404 kWh netzseitig) = 0,946.
+  #
+  # Bewusst eine Konstante und kein Konfigwert - ein Wert, den man im Diff sieht, ist
+  # besser als einer, der in einer .env verschwindet. Und bewusst eine Zahl statt einer
+  # Kennlinie: der Wirkungsgrad ist last- und temperaturabhaengig, belegt ist bisher nur
+  # der Punkt "11 kW dreiphasig". Eine Kennlinie erst, wenn Messungen bei anderen
+  # Leistungen vorliegen (einphasig, gedrosselt durch den dynamischen Stromtarif).
+  @onboard_charger_efficiency 0.95
+
   @doc "Power-Proxy: -(V*I)/1000 in kW (Integer). Vorzeichen gedreht."
   def power_kw(voltage, current) when is_number(voltage) and is_number(current) do
     round(-(voltage * current) / 1000)
@@ -190,15 +202,75 @@ defmodule TeslaMate.FleetTelemetry.Mapper do
     end
   end
 
-  # charge_energy_added ist akkuseitig zugefuehrte Energie (wie TeslaMate). Der DC-Wert
-  # ist akkuseitig; bei AC-Ladung ist ACChargingEnergyIn netzseitig (hoeher, inkl.
-  # Onboard-Charger-Verlust) und misst DIESELBE Energie an einem anderen Punkt -> NICHT
-  # addieren (die alte Summe zaehlte doppelt, ~Faktor 2). DC bevorzugt, AC nur als Fallback,
-  # falls das DC-Feld mal fehlt. Bei DC-Schnellladung ist AC ohnehin 0/nil.
+  # charge_energy_added ist akkuseitig zugefuehrte Energie (wie TeslaMate), damit die
+  # Gegenrechnung mit dem netzseitigen charge_energy_used eine Effizienz ergibt. Die QUELLE
+  # haengt an der Ladeart, nicht daran, welches Feld gerade anliegt:
+  #
+  #   DC (Supercharger): DCChargingEnergyIn - nativer, akkuseitiger Zaehler.
+  #   AC (Heimladen):    ACChargingEnergyIn (netzseitig) * @onboard_charger_efficiency.
+  #
+  # ⚠️ Warum bei AC NICHT der DC-Zaehler, obwohl er die richtige Messstelle hat
+  # (Messreihe 2026-08-05, Ladungen #383 und #390, 187 Feed-Samples):
+  #
+  #   1. Er ist auf 0,02 kWh quantisiert und haengt schwankend 0 ... 0,11 kWh zurueck.
+  #      Die Sitzungssumme ist `letzter - erster` (log.ex), es landet also die DIFFERENZ
+  #      zweier Rueckstaende im Ergebnis - ein ABSOLUTER Fehler, unabhaengig von der
+  #      Ladungsgroesse. Bei #390 (15,52 kWh) sind das 0,7 %, bei #384 (0,30 kWh) 37 %.
+  #   2. Er ist nicht monoton: im Stand faellt er (03.08.: 19,34 -> 19,24 bei 0 kW).
+  #   3. Er wird zwischen Sitzungen uebernommen statt zurueckgesetzt. #383 erbte den
+  #      Rueckstand der Vorsitzung und holte ihn waehrend der Ladung auf: gemeldet
+  #      2,40 kWh gegen 2,0182 kWh Netzbezug am Wallbox-Zaehler - akkuseitig ueber
+  #      netzseitig, also physikalisch unmoeglich.
+  #
+  # ACChargingEnergyIn deckt sich dagegen auf JEDEM der 187 Samples auf < 1 % mit
+  # ACChargingPower und ist monoton. Uebernahme zwischen Sitzungen schadet dort nicht:
+  # auf einem driftfreien Zaehler ist `letzter - erster` exakt, egal wo er startet.
+  #
+  # ⚠️ Kein stiller Rueckfall mehr auf das jeweils andere Feld. Die zwei Zaehler haben
+  # verschiedene Skalen und werden zu verschiedenen Zeitpunkten zurueckgesetzt; der alte
+  # Fallback mischte sie in EINE Spalte (belegt: 21,64 -> 0 innerhalb von 1,3 ms).
+  # Ist die Ladeart unbekannt, ist die Antwort nil = "nicht geliefert" - nie ein
+  # Ersatzwert von einer anderen Messstelle. Die Kurvenzeile faellt dann im Changeset
+  # durch (`charge_energy_added: can't be blank`), und `erster`/`letzter` greifen die
+  # naechste Zeile mit echtem Messwert - genau das ist gewollt.
   defp charge_energy_added(fields) do
-    case Map.get(fields, "DCChargingEnergyIn") do
-      v when is_number(v) -> v
-      _ -> Map.get(fields, "ACChargingEnergyIn")
+    case charge_kind(fields) do
+      :dc -> fields |> Map.get("DCChargingEnergyIn") |> number_or_nil()
+      :ac -> fields |> Map.get("ACChargingEnergyIn") |> number_or_nil() |> scale(@onboard_charger_efficiency)
+      :unknown -> nil
     end
   end
+
+  # Ladeart der laufenden Sitzung.
+  #
+  # Bewusst NICHT aus charge_source_power/2 abgeleitet: dessen letzte cond-Zweige greifen
+  # ohne `> 0` und liefern bei 0 kW "dc". Null kW sind aber genau die Rand-Zeilen einer
+  # Sitzung - und die greift log.ex als `erster`/`letzter` auf. Ein dort falscher
+  # Klassifikator wuerde die zwei Zaehler erneut mischen, nur an anderer Stelle.
+  #
+  # FastChargerPresent ist die belastbarste Quelle (eine Aussage ueber die Sitzung, nicht
+  # ueber den Augenblick), taugt aber nicht allein: Tesla sendet Felder nur bei AENDERUNG,
+  # `interval_seconds` ist eine Obergrenze und keine Zusage. Gemessen 2026-08-05 kam es in
+  # 100 Minuten genau einmal (t+16 s, mit dem Reconnect-Snapshot). Zwei AC-Ladungen
+  # hintereinander ohne Schlaf dazwischen bekommen keinen neuen Snapshot -> das Feld
+  # erreicht den je Sitzung frischen Provider-FieldState nie. Deshalb der Leistungs-
+  # Rueckfall, der greift, solange ueberhaupt Leistung fliesst.
+  defp charge_kind(fields) do
+    dc_power = Map.get(fields, "DCChargingPower")
+    ac_power = Map.get(fields, "ACChargingPower")
+
+    cond do
+      Map.get(fields, "FastChargerPresent") == true -> :dc
+      Map.get(fields, "FastChargerPresent") == false -> :ac
+      is_number(dc_power) and dc_power > 0 -> :dc
+      is_number(ac_power) and ac_power > 0 -> :ac
+      true -> :unknown
+    end
+  end
+
+  defp number_or_nil(v) when is_number(v), do: v
+  defp number_or_nil(_), do: nil
+
+  defp scale(nil, _factor), do: nil
+  defp scale(v, factor), do: v * factor
 end

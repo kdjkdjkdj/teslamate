@@ -156,15 +156,19 @@ defmodule TeslaMate.FleetTelemetry.MapperTest do
       assert attrs.charge_source == "ac"
       assert attrs.charger_power == 11
       assert attrs.charger_phases == 3
-      assert attrs.charge_energy_added == 4.2
+      # AC-Sitzung -> netzseitiger Zaehler * Wirkungsgrad
+      assert_in_delta attrs.charge_energy_added, 4.2 * 0.95, 0.0001
     end
 
-    test "AC-Ladung mit beiden Energiefeldern: charge_energy_added = akkuseitig (DC), keine Summe" do
-      # Reale Heim-AC-Ladung (12.07.2026): der Onboard-Charger wandelt AC->DC.
-      # ACChargingEnergyIn = netzseitig (vor dem Wandler), DCChargingEnergyIn = akkuseitig
-      # (nach dem Wandler, um den Ladeverlust kleiner). Beide sind DIESELBE Energie an zwei
-      # Messpunkten -> NICHT addieren (die alte Summe zaehlte doppelt, ~Faktor 2).
-      # charge_energy_added ist akkuseitig (wie TeslaMate) -> der DC-Wert.
+    test "AC-Ladung mit beiden Energiefeldern: Quelle ist AC*eta, NICHT der DC-Zaehler" do
+      # Reale Heim-AC-Ladung: der Onboard-Charger wandelt AC->DC. ACChargingEnergyIn =
+      # netzseitig (vor dem Wandler), DCChargingEnergyIn = akkuseitig (nach dem Wandler).
+      # Beide sind DIESELBE Energie an zwei Messpunkten -> nie addieren.
+      #
+      # Bis 2026-08-05 nahm der Mapper hier den DC-Wert (die richtige Messstelle). Die
+      # Messreihe an #383/#390 hat ihn verworfen: quantisiert auf 0,02 kWh, schwankender
+      # Rueckstand 0 ... 0,11 kWh, nicht monoton, Uebernahme zwischen Sitzungen. Bei #383
+      # ergab das 2,40 kWh gegen 2,0182 kWh Netzbezug - akkuseitig ueber netzseitig.
       fields = %{
         "DetailedChargeState" => "DetailedChargeStateCharging",
         "ACChargingPower" => 11.0,
@@ -177,10 +181,11 @@ defmodule TeslaMate.FleetTelemetry.MapperTest do
       attrs = Mapper.to_charge_attrs(fields, 1, ~U[2026-07-12 10:18:56.000000Z])
 
       assert attrs.charge_source == "ac"
-      assert attrs.charge_energy_added == 24.8
+      assert_in_delta attrs.charge_energy_added, 26.9 * 0.95, 0.0001
+      refute attrs.charge_energy_added == 24.8
     end
 
-    test "nil-safe: fehlende Felder -> nil, Energie robust" do
+    test "nil-safe: fehlende Felder -> nil, kein Raten der Ladeart" do
       attrs = Mapper.to_charge_attrs(%{}, 1, ~U[2026-06-23 10:08:24.000000Z])
       assert attrs.car_id == 1
       assert attrs.charger_power == nil
@@ -188,13 +193,115 @@ defmodule TeslaMate.FleetTelemetry.MapperTest do
       assert attrs.charge_energy_added == nil
       assert attrs.charging_state == nil
 
-      # nur DC-Feld -> genau dieser Wert
+      # Energiefeld ohne jede Ladeart-Evidenz (keine Leistung, kein FastChargerPresent):
+      # Ladeart unbekannt -> nil. Frueher kam hier der Rohwert heraus, egal aus welcher
+      # Messstelle er stammte.
       dc = Mapper.to_charge_attrs(%{"DCChargingEnergyIn" => 7.0}, 1, ~U[2026-06-23 10:08:24.000000Z])
-      assert dc.charge_energy_added == 7.0
+      assert dc.charge_energy_added == nil
 
-      # nur AC-Feld (DC fehlt) -> Fallback auf AC
       ac = Mapper.to_charge_attrs(%{"ACChargingEnergyIn" => 3.5}, 1, ~U[2026-06-23 10:08:24.000000Z])
-      assert ac.charge_energy_added == 3.5
+      assert ac.charge_energy_added == nil
+    end
+
+    test "Ladeart: FastChargerPresent schlaegt die Leistung" do
+      # Am Supercharger kann ACChargingPower als Altwert im gemergten Feldzustand kleben.
+      # Die Sitzungsaussage gewinnt.
+      dc =
+        Mapper.to_charge_attrs(
+          %{
+            "FastChargerPresent" => true,
+            "ACChargingPower" => 11.0,
+            "DCChargingEnergyIn" => 30.0,
+            "ACChargingEnergyIn" => 99.9
+          },
+          1,
+          ~U[2026-08-04 13:20:00.000000Z]
+        )
+
+      assert dc.charge_energy_added == 30.0
+
+      # Umgekehrt: FastChargerPresent false -> AC, auch wenn eine DC-Leistung mitlaeuft.
+      ac =
+        Mapper.to_charge_attrs(
+          %{
+            "FastChargerPresent" => false,
+            "DCChargingPower" => 5.0,
+            "DCChargingEnergyIn" => 99.9,
+            "ACChargingEnergyIn" => 10.0
+          },
+          1,
+          ~U[2026-08-05 11:00:00.000000Z]
+        )
+
+      assert_in_delta ac.charge_energy_added, 10.0 * 0.95, 0.0001
+    end
+
+    test "Ladeart: Leistungs-Rueckfall, wenn FastChargerPresent fehlt" do
+      # Zwei AC-Ladungen hintereinander ohne Schlaf: kein Reconnect-Snapshot, also kein
+      # FastChargerPresent im frischen Provider-FieldState. Ohne diesen Rueckfall fiele
+      # die ganze Sitzung aus (jede Kurvenzeile ohne Energie -> Changeset verwirft sie).
+      ac =
+        Mapper.to_charge_attrs(
+          %{"ACChargingPower" => 10.7, "ACChargingEnergyIn" => 4.0, "DCChargingEnergyIn" => 3.6},
+          1,
+          ~U[2026-08-05 11:00:00.000000Z]
+        )
+
+      assert_in_delta ac.charge_energy_added, 4.0 * 0.95, 0.0001
+
+      # Am Supercharger vor dem Eintreffen von FastChargerPresent (bei #386 die ersten
+      # drei Zeilen) traegt die DC-Leistung die Entscheidung.
+      dc =
+        Mapper.to_charge_attrs(
+          %{"DCChargingPower" => 37.0, "DCChargingEnergyIn" => 8.0, "ACChargingEnergyIn" => 0.0},
+          1,
+          ~U[2026-08-04 13:13:00.000000Z]
+        )
+
+      assert dc.charge_energy_added == 8.0
+    end
+
+    test "Rand-Zeile bei 0 kW ohne Ladeart -> nil statt geratener Quelle" do
+      # charge_source_power/2 liefert hier "dc" (cond-Zweig ohne `> 0`). Genau solche
+      # Zeilen greift log.ex als `erster`/`letzter` auf - die Energie darf hier NICHT aus
+      # einer geratenen Messstelle kommen. nil laesst den Changeset die Zeile verwerfen,
+      # `erster` rueckt auf die naechste Zeile mit echtem Messwert.
+      attrs =
+        Mapper.to_charge_attrs(
+          %{
+            "DCChargingPower" => 0,
+            "ACChargingPower" => 0,
+            "DCChargingEnergyIn" => 19.24,
+            "ACChargingEnergyIn" => 20.9
+          },
+          1,
+          ~U[2026-08-03 17:00:52.000000Z]
+        )
+
+      assert attrs.charge_source == "dc"
+      assert attrs.charge_energy_added == nil
+    end
+
+    test "kein stiller Rueckfall auf die andere Messstelle" do
+      # AC-Sitzung, AC-Feld fehlt -> nil, NICHT der DC-Zaehler.
+      ac =
+        Mapper.to_charge_attrs(
+          %{"FastChargerPresent" => false, "ACChargingPower" => 11.0, "DCChargingEnergyIn" => 24.8},
+          1,
+          ~U[2026-08-05 11:00:00.000000Z]
+        )
+
+      assert ac.charge_energy_added == nil
+
+      # DC-Sitzung, DC-Feld fehlt -> nil, NICHT der AC-Zaehler.
+      dc =
+        Mapper.to_charge_attrs(
+          %{"FastChargerPresent" => true, "DCChargingPower" => 37.0, "ACChargingEnergyIn" => 26.9},
+          1,
+          ~U[2026-08-04 13:20:00.000000Z]
+        )
+
+      assert dc.charge_energy_added == nil
     end
 
     test "charge_phase normalisiert beide Schreibweisen" do
@@ -238,8 +345,9 @@ defmodule TeslaMate.FleetTelemetry.MapperTest do
       assert cs.charger_voltage == 224
       assert cs.charger_actual_current == 16
       assert cs.charger_phases == 2
-      # akkuseitig (DC bevorzugt), keine Summe mit AC
-      assert cs.charge_energy_added == 24.8
+      # AC-Sitzung (ACChargingPower > 0) -> netzseitiger Zaehler * Wirkungsgrad,
+      # nicht der DC-Zaehler. Siehe to_charge_attrs/3-Test zur Begruendung.
+      assert_in_delta cs.charge_energy_added, 26.9 * 0.95, 0.0001
       assert cs.battery_level == 63
       assert_in_delta cs.rated_battery_range_km, 297.7, 0.5
     end
