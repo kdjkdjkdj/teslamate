@@ -36,6 +36,12 @@ defmodule TeslaMate.Vehicles.Vehicle do
               # curve (insert_charge) from the feed and throttles the charge poll (charge_fleet_active?).
               charge_stream_pid: nil,
               last_charge_stream_at: nil,
+              # last_charge_stream_energy: zuletzt aus dem Feed abgeleitetes charge_energy_added
+              # der LAUFENDEN Ladung. Noetig, weil Poll- und Feed-Zeilen in dieselbe Spalte
+              # schreiben, aber aus verschiedenen Quellen stammen - siehe charge_energy_added/2.
+              # ⚠️ Wird beim Verlassen von {:charging, _} genullt: ein Wert der Vorsitzung
+              # duerfte NIE in die naechste Ladung lecken (vgl. die Begruendung bei keep/2).
+              last_charge_stream_energy: nil,
               # charge_watch_pid: Dauer-Abonnent auf `DetailedChargeState`, der - anders als
               # charge_stream_pid - ueber ALLE Zustaende lebt. Er existiert nur, um einen
               # Ladebeginn zu bemerken, waehrend die Aufzeichnung suspendiert ist; dort ignoriert
@@ -881,6 +887,11 @@ defmodule TeslaMate.Vehicles.Vehicle do
     case Mapper.charge_phase(cs.charging_state) do
       phase when phase in ["starting", "charging"] ->
         vehicle = merge_charge(data.last_response, cs, time: true)
+
+        # VOR dem insert_charge merken: charge_energy_added/2 zieht den Wert von hier, damit
+        # eine Poll-Zeile bei frischem Feed dieselbe Quelle traegt wie die Feed-Zeilen. Fuer
+        # diese Feed-Zeile selbst ist es derselbe Wert - das Verhalten aendert sich hier nicht.
+        data = %Data{data | last_charge_stream_energy: vehicle.charge_state.charge_energy_added}
         :ok = insert_charge(cproc, vehicle, data)
 
         data = %Data{data | last_response: vehicle, last_charge_stream_at: DateTime.utc_now()}
@@ -913,8 +924,18 @@ defmodule TeslaMate.Vehicles.Vehicle do
 
         :ok = disconnect_charge_stream(data)
 
-        {:next_state, :start, %Data{data | last_response: vehicle, charge_stream_pid: nil},
-         [broadcast_summary(), schedule_fetch(0, data)]}
+        # last_charge_stream_energy genullt: der Zaehlerstand dieser Ladung darf die naechste
+        # nicht als Startwert erreichen. charge_fleet_active?/1 wuerde hier zwar ohnehin
+        # scheitern (charge_stream_pid: nil), aber die Invariante haengt dann an einem
+        # Seiteneffekt statt an einer Zuweisung - genau das war bei keep/2 schon einmal die
+        # Falle.
+        {:next_state, :start,
+         %Data{
+           data
+           | last_response: vehicle,
+             charge_stream_pid: nil,
+             last_charge_stream_energy: nil
+         }, [broadcast_summary(), schedule_fetch(0, data)]}
 
       _ ->
         # Idle/Disconnected/unbekannt: nur Freshness, kein Kurvenpunkt.
@@ -1888,7 +1909,7 @@ defmodule TeslaMate.Vehicles.Vehicle do
       battery_heater_no_power: vehicle.climate_state.battery_heater_no_power,
       battery_level: vehicle.charge_state.battery_level,
       usable_battery_level: vehicle.charge_state.usable_battery_level,
-      charge_energy_added: vehicle.charge_state.charge_energy_added,
+      charge_energy_added: charge_energy_added(vehicle, data),
       charger_actual_current: vehicle.charge_state.charger_actual_current,
       charger_phases: vehicle.charge_state.charger_phases,
       charger_pilot_current: vehicle.charge_state.charger_pilot_current,
@@ -2417,6 +2438,32 @@ defmodule TeslaMate.Vehicles.Vehicle do
       interval("POLLING_FLEET_CHARGING_INTERVAL", 300)
     else
       determince_interval(power)
+    end
+  end
+
+  # Quelle fuer charge_energy_added einer Kurvenzeile.
+  #
+  # ⚠️ Poll- und Feed-Zeilen landen in DERSELBEN Spalte, stammen aber aus verschiedenen
+  # Messungen: die Poll-Zeile traegt Teslas REST-`charge_energy_added`, die Feed-Zeile den
+  # Wert aus `ACChargingEnergyIn` (Mapper). Die Sitzungssumme ist `letzter - erster`
+  # (log.ex), und die ERSTE Zeile einer Ladung ist praktisch immer eine Poll-Zeile - der
+  # charging_process entsteht aus einem Poll. Die Mischung ist damit systematisch, nicht
+  # gelegentlich, und sie faellt immer auf denselben Summanden.
+  #
+  # Der REST-Wert ist zudem auf 0,1 kWh gerundet. Gemessen an #392 (2026-08-05, 0,42 kWh
+  # in 2,5 min): erste Zeile 0,10 aus dem Poll gegen 0,118 aus dem Feed zum selben
+  # Zeitpunkt -> `letzter - erster` ergab 0,44 statt 0,4207, also +4,6 %. Bei einer langen
+  # Ladung verschwindet derselbe absolute Versatz im Rauschen, bei einer kurzen nicht.
+  #
+  # Solange der Lade-Feed frisch ist, gilt deshalb SEIN Wert auch fuer Poll-Zeilen. Fehlt er
+  # (Feed-Stall, Ladung ohne Feed), bleibt es beim REST-Wert - dann ist die ganze Sitzung
+  # wieder aus einer Quelle.
+  @doc false
+  def charge_energy_added(%Vehicle{} = vehicle, %Data{} = data) do
+    if charge_fleet_active?(data) and is_number(data.last_charge_stream_energy) do
+      data.last_charge_stream_energy
+    else
+      vehicle.charge_state.charge_energy_added
     end
   end
 
