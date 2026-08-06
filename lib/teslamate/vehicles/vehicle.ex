@@ -893,7 +893,11 @@ defmodule TeslaMate.Vehicles.Vehicle do
   def handle_event(:info, {:stream_charge, %ChargeStream{} = cs}, {:charging, cproc}, %Data{} = data) do
     case Mapper.charge_phase(cs.charging_state) do
       phase when phase in ["starting", "charging"] ->
-        vehicle = merge_charge(data.last_response, cs, time: true)
+        # keep_power?: der Feed meldet `ChargerPower` onChange - bei konstantem Laden also
+        # einmal und danach nie wieder. Ohne Fortschreiben traegt jede weitere Kurvenzeile
+        # 0 kW (siehe charge_power/3). Die Stopped/Complete-Kante unten bekommt die Option
+        # bewusst NICHT.
+        vehicle = merge_charge(data.last_response, cs, time: true, keep_power?: true)
 
         # VOR dem insert_charge merken: charge_energy_added/2 zieht den Wert von hier, damit
         # eine Poll-Zeile bei frischem Feed dieselbe Quelle traegt wie die Feed-Zeilen. Fuer
@@ -2241,7 +2245,7 @@ defmodule TeslaMate.Vehicles.Vehicle do
           charge
           | timestamp: timestamp,
             charging_state: cs.charging_state,
-            charger_power: cs.charger_power,
+            charger_power: charge_power(cs, charge, opts),
             charger_voltage: keep(cs.charger_voltage, charge.charger_voltage),
             charger_actual_current:
               keep(cs.charger_actual_current, charge.charger_actual_current),
@@ -2257,6 +2261,17 @@ defmodule TeslaMate.Vehicles.Vehicle do
             fast_charger_type: cs.fast_charger_type
         }
     }
+  end
+
+  # `charger_power` wird nur auf der Kurvenzeile fortgeschrieben (`keep_power?: true`),
+  # nicht an der Stopped/Complete-Kante: dort faellt die Leistung wirklich auf 0, und ein
+  # festgehaltener Altwert ginge in die Integration des letzten Intervalls ein - aus einem
+  # zu kleinen `charge_energy_used` wuerde ein zu grosses. Eine ausdrueckliche 0 aus dem
+  # Feed (Ladepause, auf 0 A gedrosselt) gewinnt immer, weil keep/2 nur `nil` ersetzt.
+  defp charge_power(%ChargeStream{charger_power: power}, %Charge{} = charge, opts) do
+    if Keyword.get(opts, :keep_power?, false),
+      do: keep(power, charge.charger_power),
+      else: power
   end
 
   # Ein `nil` aus dem Feed heisst "noch nicht geliefert", nicht "auf null gefallen" - der
@@ -2281,7 +2296,16 @@ defmodule TeslaMate.Vehicles.Vehicle do
   #
   # - `charging_state`: eine Phase ist eine Aussage, kein Fuellwert - sonst wird eine echte
   #   Stopped-Kante verschleiert.
-  # - `charger_power`: `insert_charge` defaultet inline auf 0.
+  # ⚠️ Hier stand bis 2026-08-06: "`charger_power`: `insert_charge` defaultet inline auf 0"
+  # als Begruendung, es NICHT fortzuschreiben. Das ist durch Ladung #384 (04.08.) widerlegt -
+  # der Inline-Default ist nicht harmlos, er ist der Ausloeser. Aus 34 von 36 Zeilen ohne
+  # `ChargerPower` wurden harte Nullen; `determine_phases` leitet aus der Leistung die
+  # Phasenzahl ab, landete im Toleranzband bei 0 Phasen, und `calculate_energy_used`
+  # multiplizierte jede Zeile mit 0 -> `charge_energy_used` = 0,00 statt ~0,33 kWh.
+  # Gefaehrlicher als ein NULL, weil die 0,00 den Filter `energy_used >= 0` passiert und als
+  # Zahl im Dashboard steht. Fortgeschrieben wird seither ueber charge_power/3 (oben), aber
+  # NUR auf der Kurvenzeile. Die andere Haelfte der Ursache - dass 0 als Phasenzahl
+  # ueberhaupt durchgeht - liegt bei Upstream: teslamate-org/teslamate#5586.
   # - `charge_energy_added`: ⚠️ hier waere Fortschreiben SCHAEDLICH. Der Zaehler der VORIGEN
   #   Ladung wuerde als Startwert der neuen erscheinen und die Kurve verfaelschen - schlimmer
   #   als eine Luecke. Deshalb sichert das Warm-up-Gate dieses Feld ab (Alternativgruppe
