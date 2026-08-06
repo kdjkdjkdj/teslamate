@@ -126,6 +126,11 @@ defmodule TeslaMate.FleetTelemetry.StreamProvider do
       streaming?: false,
       timer: nil,
       client_id: nil,
+      # Entprellung: > 0 sammelt Trigger, die im selben Payload liegen, zu EINEM Emit.
+      # Default 0 = aus, damit Fahr-Feed und Ladewaechter unveraendert bleiben.
+      debounce_ms: Keyword.get(opts, :debounce_ms, 0),
+      emit_timer: nil,
+      pending: nil,
       # Erst ein ausdrueckliches :up des Handlers schaltet das auf true. Vor der ersten
       # Meldung gilt die Verbindung als geschlossen - die sichere Richtung.
       connected?: false
@@ -163,6 +168,18 @@ defmodule TeslaMate.FleetTelemetry.StreamProvider do
 
           st
 
+        st.debounce_ms > 0 and not st.emit_always.(field, value) ->
+          # Entprellen. Der Lade-Provider triggert auf DREI Feldern (DetailedChargeState,
+          # DC-/ACChargingEnergyIn), alle mit 30 s konfiguriert; landen zwei davon im selben
+          # Payload, entstanden ZWEI Emits mit derselben Ereigniszeit. Gemessen an Ladung #390
+          # (05.08.2026): 77 Zeilenpaare auf die Millisekunde gleich, bei unterschiedlichem
+          # charge_energy_added - der zweite Emit sah einen neueren Feldzustand. Statt sofort
+          # zu emittieren wird der Emit kurz aufgeschoben und sammelt den Rest des Payloads ein.
+          #
+          # ⚠️ Die emit_always-Kante (Lade-Ende) wird NIE aufgeschoben - ein spaet gemeldetes
+          # Ende laesst den charging_process offen, das waere schlimmer als ein Duplikat.
+          schedule_emit(st, field, value)
+
         true ->
           if st.warmup? and missing(st, fs) != [] do
             # Der Grund gehoert in die Zeile. Die alte Fassung nannte immer "warm-up beendet"
@@ -182,17 +199,7 @@ defmodule TeslaMate.FleetTelemetry.StreamProvider do
             )
           end
 
-          sd = st.map_fun.(FieldState.fields(fs), now)
-          # Stream-Daten zuerst, dann das Freshness-Signal: so bleibt die
-          # Objekt-Reihenfolge fuer den FSM eindeutig.
-          safe_emit(st.receiver, sd)
-          safe_emit(st.receiver, :fleet_streaming)
-
-          if not st.streaming? do
-            Logger.info("#{st.label} active - receiving live data")
-          end
-
-          arm_timer(%{st | streaming?: true, warmup?: false})
+          st |> cancel_emit() |> do_emit(fs, now)
       end
 
     {:noreply, st}
@@ -211,6 +218,16 @@ defmodule TeslaMate.FleetTelemetry.StreamProvider do
     # Timer nicht neu armen -> erst die naechste Telemetrie startet ihn wieder.
     {:noreply, %{st | streaming?: false, timer: nil}}
   end
+
+  # Das Entprell-Fenster ist abgelaufen: jetzt EIN Emit mit dem inzwischen vollstaendigen
+  # Feldzustand. Ohne `pending` ist der Timer bereits abgeraeumt worden (cancel_emit/1) und
+  # diese Nachricht war nur noch unterwegs - dann passiert nichts.
+  def handle_info(:emit_due, %{pending: {_field, _value}} = st) do
+    st = %{st | emit_timer: nil, pending: nil}
+    {:noreply, do_emit(st, st.state, DateTime.utc_now())}
+  end
+
+  def handle_info(:emit_due, st), do: {:noreply, %{st | emit_timer: nil}}
 
   def handle_info(_msg, st), do: {:noreply, st}
 
@@ -266,6 +283,35 @@ defmodule TeslaMate.FleetTelemetry.StreamProvider do
   defp arm_timer(%{timer: t, stall_ms: ms} = st) do
     if is_reference(t), do: Process.cancel_timer(t)
     %{st | timer: Process.send_after(self(), :stall, ms)}
+  end
+
+  defp schedule_emit(%{emit_timer: nil, debounce_ms: ms} = st, field, value) do
+    %{st | emit_timer: Process.send_after(self(), :emit_due, ms), pending: {field, value}}
+  end
+
+  # Ein laufendes Fenster wird NICHT verlaengert - sonst schoebe ein Dauerstrom von Triggern
+  # den Emit beliebig weit hinaus. Gemerkt wird nur der juengste Ausloeser.
+  defp schedule_emit(st, field, value), do: %{st | pending: {field, value}}
+
+  defp cancel_emit(%{emit_timer: nil} = st), do: st
+
+  defp cancel_emit(%{emit_timer: t} = st) do
+    Process.cancel_timer(t)
+    %{st | emit_timer: nil, pending: nil}
+  end
+
+  defp do_emit(st, fs, now) do
+    sd = st.map_fun.(FieldState.fields(fs), now)
+    # Stream-Daten zuerst, dann das Freshness-Signal: so bleibt die
+    # Objekt-Reihenfolge fuer den FSM eindeutig.
+    safe_emit(st.receiver, sd)
+    safe_emit(st.receiver, :fleet_streaming)
+
+    if not st.streaming? do
+      Logger.info("#{st.label} active - receiving live data")
+    end
+
+    arm_timer(%{st | streaming?: true, warmup?: false})
   end
 
   defp safe_emit(receiver, payload) do

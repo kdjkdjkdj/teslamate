@@ -71,6 +71,10 @@ defmodule TeslaMate.Vehicles.Vehicle do
   # Der Waechter hat keine Freshness-Semantik und darf dieselbe Phase mehrfach melden;
   # ohne Abstand wuerde daraus ein Poll je Feed-Ereignis.
   @charge_watch_debounce_ms :timer.seconds(60)
+  # Sammelfenster fuer den Lade-Feed: seine drei Trigger-Felder liegen oft im selben
+  # Payload und erzeugten dann doppelte Kurvenzeilen (Ladung #390, 05.08.2026: 77 Paare
+  # auf die Millisekunde gleich). Grosszuegig gewaehlt - die echte Kadenz sind 15-30 s.
+  @charge_emit_debounce_ms 250
 
   @drive_timeout_min 15
 
@@ -2711,6 +2715,7 @@ defmodule TeslaMate.Vehicles.Vehicle do
              vin: car.vin,
              receiver: fn payload -> send(me, {:stream_charge, payload}) end,
              trigger_field: ["DetailedChargeState", "DCChargingEnergyIn", "ACChargingEnergyIn"],
+             debounce_ms: @charge_emit_debounce_ms,
              map_fun: &Mapper.to_charge_stream/2,
              # Charge.changeset verlangt drei payload-abhaengige Felder, jedes fuer sich
              # hinreichend zum Verwerfen der Kurvenzeile: charge_energy_added, charger_power
