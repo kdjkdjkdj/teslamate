@@ -127,6 +127,7 @@ defmodule TeslaMate.Vehicles.Vehicle do
   def charging_interval, do: interval("POLLING_CHARGING_INTERVAL", 5)
   def minimum_interval, do: interval("POLLING_MINIMUM_INTERVAL", 0)
   def fleet_driving_interval, do: interval("POLLING_FLEET_DRIVING_INTERVAL", 180)
+  def fleet_parked_interval, do: interval("POLLING_FLEET_PARKED_INTERVAL", 300)
 
   def identify(%Vehicle{display_name: name, vin: vin, vehicle_config: config}) do
     case config do
@@ -1992,55 +1993,73 @@ defmodule TeslaMate.Vehicles.Vehicle do
     case can_fall_asleep(vehicle, data) do
       {:error, :sentry_mode} ->
         {:keep_state, %Data{data | last_used: DateTime.utc_now()},
-         [broadcast_summary(), schedule_fetch(30 * i, data)]}
+         [broadcast_summary(), schedule_fetch(parked_poll_interval(data, 30 * i), data)]}
 
       {:error, :preconditioning} ->
         if suspend?, do: Logger.warning("Preconditioning ...", car_id: car.id)
 
         {:keep_state, %Data{data | last_used: DateTime.utc_now()},
-         [broadcast_summary(), schedule_fetch(30 * i, data)]}
+         [broadcast_summary(), schedule_fetch(parked_poll_interval(data, 30 * i), data)]}
 
       {:error, :dogmode} ->
         if suspend?, do: Logger.warning("Dog Mode is enabled ...", car_id: car.id)
 
         {:keep_state, %Data{data | last_used: DateTime.utc_now()},
-         [broadcast_summary(), schedule_fetch(30 * i, data)]}
+         [broadcast_summary(), schedule_fetch(parked_poll_interval(data, 30 * i), data)]}
 
       {:error, :user_present} ->
         if suspend?, do: Logger.warning("User present ...", car_id: car.id)
 
         {:keep_state, %Data{data | last_used: DateTime.utc_now()},
-         [broadcast_summary(), schedule_fetch(default_interval(), data)]}
+         [
+           broadcast_summary(),
+           schedule_fetch(parked_poll_interval(data, default_interval()), data)
+         ]}
 
       {:error, :downloading_update} ->
         if suspend?, do: Logger.warning("Downloading update ...", car_id: car.id)
 
         {:keep_state, %Data{data | last_used: DateTime.utc_now()},
-         [broadcast_summary(), schedule_fetch(default_interval() * i, data)]}
+         [
+           broadcast_summary(),
+           schedule_fetch(parked_poll_interval(data, default_interval() * i), data)
+         ]}
 
       {:error, :doors_open} ->
         if suspend?, do: Logger.warning("Doors open ...", car_id: car.id)
 
         {:keep_state, %Data{data | last_used: DateTime.utc_now()},
-         [broadcast_summary(), schedule_fetch(default_interval() * i, data)]}
+         [
+           broadcast_summary(),
+           schedule_fetch(parked_poll_interval(data, default_interval() * i), data)
+         ]}
 
       {:error, :trunk_open} ->
         if suspend?, do: Logger.warning("Trunk open ...", car_id: car.id)
 
         {:keep_state, %Data{data | last_used: DateTime.utc_now()},
-         [broadcast_summary(), schedule_fetch(default_interval() * i, data)]}
+         [
+           broadcast_summary(),
+           schedule_fetch(parked_poll_interval(data, default_interval() * i), data)
+         ]}
 
       {:error, :power_usage} ->
         if suspend?, do: Logger.warning("Power usage ...", car_id: car.id)
 
         {:keep_state, %Data{data | last_used: DateTime.utc_now()},
-         [broadcast_summary(), schedule_fetch(default_interval() * i, data)]}
+         [
+           broadcast_summary(),
+           schedule_fetch(parked_poll_interval(data, default_interval() * i), data)
+         ]}
 
       {:error, :unlocked} ->
         if suspend? and not service_mode?, do: Logger.warning("Unlocked ...", car_id: car.id)
 
         {:keep_state_and_data,
-         [broadcast_summary(), schedule_fetch(default_interval() * i, data)]}
+         [
+           broadcast_summary(),
+           schedule_fetch(parked_poll_interval(data, default_interval() * i), data)
+         ]}
 
       :ok ->
         if suspend? do
@@ -2187,13 +2206,13 @@ defmodule TeslaMate.Vehicles.Vehicle do
         },
         vehicle_state: %{
           vehicle.vehicle_state
-          # ⚠️ NICHT bedingungslos setzen. `last_response` ist die Fallback-Quelle, aus der
-          # create_position/2 den Odometer zieht, wenn der Feed keinen liefert. Ein
-          # durchgeschriebenes nil loescht genau diese Quelle - der Fallback entzieht sich
-          # selbst die Grundlage. Gemessen 2026-08-03 an Fahrt 170: nach dem degradierten
-          # Warm-up-Emit war last_response.odometer nil, Position 17507 blieb ohne.
-          # Gefahrlos, weil der Odometer monoton ist (vgl. create_position/2).
-          | odometer: keep(stream_data.odometer, vehicle.vehicle_state.odometer)
+          | # ⚠️ NICHT bedingungslos setzen. `last_response` ist die Fallback-Quelle, aus der
+            # create_position/2 den Odometer zieht, wenn der Feed keinen liefert. Ein
+            # durchgeschriebenes nil loescht genau diese Quelle - der Fallback entzieht sich
+            # selbst die Grundlage. Gemessen 2026-08-03 an Fahrt 170: nach dem degradierten
+            # Warm-up-Emit war last_response.odometer nil, Position 17507 blieb ohne.
+            # Gefahrlos, weil der Odometer monoton ist (vgl. create_position/2).
+            odometer: keep(stream_data.odometer, vehicle.vehicle_state.odometer)
         }
     }
   end
@@ -2462,6 +2481,41 @@ defmodule TeslaMate.Vehicles.Vehicle do
   end
 
   defp charge_fleet_active?(_), do: false
+
+  # Wach, geparkt - und am Suspend gehindert (User im Auto, Tueren offen, Verbraucher an,
+  # Sentry). Upstream pollt dort 15-30 s lang, weil er sonst einen Fahrt- oder Ladebeginn
+  # verpassen wuerde, und `last_used` wird in diesen Zweigen staendig zurueckgesetzt: der
+  # Suspend kommt nie, das Polling laeuft, solange der Grund besteht. Gemessen 2026-08-05:
+  # 17:33-18:00 durchgehend 15- bzw. 30-s-Takt = ~60 Abfragen ~ 0,12 EUR in einem einzigen
+  # Parkvorgang, bei hartem 10-EUR-Monatslimit.
+  #
+  # Mit dem Fleet-Feed muss TeslaMate dort nicht wachen: den Fahrtbeginn meldet der
+  # Fahr-Provider mit der ersten `Location` (handle_event {:stream, %Stream.Data{
+  # shift_state: "D"}}, :online -> start_drive), den Ladebeginn der Ladewaechter ueber
+  # `DetailedChargeState` (handle_event {:charge_watch, raw}, :online -> schedule_fetch(0)).
+  #
+  # ⚠️ Deshalb haengt die Drosselung an der Existenz dieser beiden Dauer-Abonnenten und
+  # NICHT an fleet_stream_active?/1: ein parkendes Auto sendet per Design keine Location,
+  # der Feed ist hier still, aber nicht tot. Ein Freshness-Gate waere genau dort inert, wo
+  # gedrosselt werden soll. Faellt einer der beiden weg, gilt sofort wieder der
+  # Upstream-Takt - langsam pollen darf nur, wer geweckt wird.
+  #
+  # ⚠️ Bewusst NICHT gedrosselt wird der :ok-Zweig vor dem Suspend: dort laeuft die
+  # Leerlauf-Uhr bis "Suspending logging", und die beendet das Polling ganz. Dort langsamer
+  # zu pollen hiesse, den Suspend hinauszuzoegern - teurer statt billiger.
+  @doc false
+  def parked_poll_interval(%Data{} = data, fallback) do
+    if fleet_parked_covered?(data),
+      do: max(fleet_parked_interval(), fallback),
+      else: fallback
+  end
+
+  defp fleet_parked_covered?(%Data{} = data) do
+    fleet_feed_enabled?(data) and streaming?(data) and
+      charge_watch_enabled?(data) and charge_watching?(data)
+  end
+
+  defp charge_watching?(%Data{charge_watch_pid: pid}), do: is_pid(pid) and Process.alive?(pid)
 
   # Gedrosselter Lade-Poll-Takt bei frischem Feed (Default 300 s), sonst die normale
   # determince_interval-Logik (power-abhaengig, Fallback bei Feed-Stall).

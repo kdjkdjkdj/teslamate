@@ -36,7 +36,12 @@ defmodule TeslaMate.Vehicles.Vehicle.ChargeWatchOnlineTest do
     # Poll. Mit einer Liste aus Tupeln + abschliessender Funktion waere der Mock je nach
     # Anzahl der Startpolls noch gar nicht bei der Funktion - dann bleibt es still, und der
     # Test misst nichts.
-    events = [fn -> send(me, :fetched); {:ok, blocked(now_ts)} end]
+    events = [
+      fn ->
+        send(me, :fetched)
+        {:ok, blocked(now_ts)}
+      end
+    ]
 
     :ok = start_vehicle(name, events)
 
