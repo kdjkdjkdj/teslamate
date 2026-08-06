@@ -50,6 +50,8 @@ defmodule TeslaMate.Vehicles.Vehicle do
               # beginnende Ladung bis zum Ende des Suspend-Fensters unerfasst (gemessen
               # 2026-08-03: 11 min, 1,80 kWh).
               charge_watch_pid: nil,
+              # Zeitpunkt des letzten vom Ladewaechter vorgezogenen Polls (Debounce, s. o.).
+              last_charge_watch_fetch: nil,
               # pre_online_check tracks whether an apparent online event is a real wakeup or a brief
               # subsystem check. Some vehicles (especially MCU2-upgraded cars) wake briefly (~2-3 min)
               # each hour for subsystem checks and report online, but requesting vehicle_data causes a
@@ -65,6 +67,10 @@ defmodule TeslaMate.Vehicles.Vehicle do
   end
 
   @asleep_interval 30
+  # Mindestabstand zwischen zwei vorgezogenen Polls des Ladewaechters im Wachzustand.
+  # Der Waechter hat keine Freshness-Semantik und darf dieselbe Phase mehrfach melden;
+  # ohne Abstand wuerde daraus ein Poll je Feed-Ereignis.
+  @charge_watch_debounce_ms :timer.seconds(60)
 
   @drive_timeout_min 15
 
@@ -991,9 +997,30 @@ defmodule TeslaMate.Vehicles.Vehicle do
     end
   end
 
-  # In allen anderen Zustaenden ist nichts zu tun: {:charging, _} laeuft schon, :online pollt
-  # regulaer, und im Schlaf faengt der kostenlose 30-s-Wach-Check den Ladebeginn (gemessen
-  # 2026-08-03: 30,7 s). Faengt auch das :fleet_streaming-Freshness-Signal des Providers ab.
+  # Auch im Wachzustand darf der Ladebeginn nicht auf den naechsten regulaeren Poll warten.
+  # Der liegt 15-30 s entfernt - mit der Parkdrosselung (parked_poll_interval/2) bis zu
+  # 5 min. Gemessen 2026-08-05 an Ladung #392: 52 s / ~0,12 kWh fehlten zwischen dem Start
+  # an der Wallbox und der Anlage des Vorgangs; der Ladewaechter sass daneben und durfte
+  # nichts tun, weil er nur im Suspend zustaendig war.
+  #
+  # Kosten: kein zusaetzlicher Poll, sondern derselbe, nur frueher. Ein zweiter entstuende
+  # nur, wenn der Feed die Ladephase meldet, ohne dass daraus ein Ladevorgang wird -
+  # dagegen der Mindestabstand @charge_watch_debounce_ms.
+  def handle_event(:info, {:charge_watch, raw}, :online, %Data{} = data)
+      when is_binary(raw) do
+    if Mapper.charge_phase(raw) in ["starting", "charging"] and charge_watch_due?(data) do
+      Logger.info("Charge watch: #{raw} while online - fetching now", car_id: data.car.id)
+
+      {:keep_state, %Data{data | last_charge_watch_fetch: DateTime.utc_now()},
+       schedule_fetch(0, data)}
+    else
+      :keep_state_and_data
+    end
+  end
+
+  # In allen anderen Zustaenden ist nichts zu tun: {:charging, _} laeuft schon, und im Schlaf
+  # faengt der kostenlose 30-s-Wach-Check den Ladebeginn (gemessen 2026-08-03: 30,7 s).
+  # Faengt auch das :fleet_streaming-Freshness-Signal des Providers ab.
   def handle_event(:info, {:charge_watch, _payload}, _state, _data) do
     :keep_state_and_data
   end
@@ -2387,6 +2414,12 @@ defmodule TeslaMate.Vehicles.Vehicle do
   end
 
   def charge_watch_enabled?(_), do: false
+
+  defp charge_watch_due?(%Data{last_charge_watch_fetch: nil}), do: true
+
+  defp charge_watch_due?(%Data{last_charge_watch_fetch: %DateTime{} = t}) do
+    DateTime.diff(DateTime.utc_now(), t, :millisecond) >= @charge_watch_debounce_ms
+  end
 
   # Kein Warm-up-Gate und keine Alternativgruppen: der Waechter will das FRUEHESTE Signal,
   # nicht ein vollstaendiges. Stall-Timer praktisch aus, er hat keine Freshness-Semantik.
