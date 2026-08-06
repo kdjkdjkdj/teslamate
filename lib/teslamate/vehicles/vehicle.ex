@@ -2518,11 +2518,19 @@ defmodule TeslaMate.Vehicles.Vehicle do
   # shift_state: "D"}}, :online -> start_drive), den Ladebeginn der Ladewaechter ueber
   # `DetailedChargeState` (handle_event {:charge_watch, raw}, :online -> schedule_fetch(0)).
   #
-  # ⚠️ Deshalb haengt die Drosselung an der Existenz dieser beiden Dauer-Abonnenten und
-  # NICHT an fleet_stream_active?/1: ein parkendes Auto sendet per Design keine Location,
-  # der Feed ist hier still, aber nicht tot. Ein Freshness-Gate waere genau dort inert, wo
+  # ⚠️ Deshalb haengt die Drosselung an den beiden Dauer-Abonnenten und NICHT an
+  # fleet_stream_active?/1: ein parkendes Auto sendet per Design keine Location, der Feed
+  # ist hier still, aber nicht tot. Ein Freshness-Gate waere genau dort inert, wo
   # gedrosselt werden soll. Faellt einer der beiden weg, gilt sofort wieder der
   # Upstream-Takt - langsam pollen darf nur, wer geweckt wird.
+  #
+  # ⚠️ `Process.alive?/1` allein genuegt dafuer NICHT: der StreamProvider ueberlebt einen
+  # Stall absichtlich und lebt auch dann weiter, wenn die MQTT-Strecke weg ist. Die
+  # Abdeckung saehe intakt aus, weckt aber niemanden. Deshalb zusaetzlich
+  # StreamProvider.connected?/1 - der Provider fuehrt den Verbindungsstatus aus den
+  # :up/:down-Meldungen des Tortoise-Handlers. Die Funktion antwortet konservativ (alles
+  # ausser einem klaren true = false) und faengt Timeouts, damit ein haengender Provider
+  # den FSM nicht blockiert.
   #
   # ⚠️ Bewusst NICHT gedrosselt wird der :ok-Zweig vor dem Suspend: dort laeuft die
   # Leerlauf-Uhr bis "Suspending logging", und die beendet das Polling ganz. Dort langsamer
@@ -2536,7 +2544,9 @@ defmodule TeslaMate.Vehicles.Vehicle do
 
   defp fleet_parked_covered?(%Data{} = data) do
     fleet_feed_enabled?(data) and streaming?(data) and
-      charge_watch_enabled?(data) and charge_watching?(data)
+      StreamProvider.connected?(data.stream_pid) and
+      charge_watch_enabled?(data) and charge_watching?(data) and
+      StreamProvider.connected?(data.charge_watch_pid)
   end
 
   defp charge_watching?(%Data{charge_watch_pid: pid}), do: is_pid(pid) and Process.alive?(pid)

@@ -10,19 +10,30 @@ defmodule TeslaMate.FleetTelemetry.Handler do
         list when is_list(list) -> list
       end
 
-    {:ok, %{targets: targets}}
+    # status_target bekommt Verbindungswechsel gemeldet - bewusst NICHT `targets`:
+    # dort haengen auch die Shadow-Recorder, und deren handle_cast/2 kennt nur
+    # {:ingest, ...}. Ein unbekannter Cast wuerde sie mit FunctionClauseError abraeumen.
+    {:ok, %{targets: targets, status_target: Keyword.get(opts, :status_target)}}
   end
 
   @impl true
   def connection(:up, state) do
     Logger.info("FleetTelemetry MQTT connection established")
+    notify(state, :up)
     {:ok, state}
   end
 
   def connection(status, state) when status in [:down, :terminating] do
     Logger.warning("FleetTelemetry MQTT connection #{status}")
+    notify(state, status)
     {:ok, state}
   end
+
+  defp notify(%{status_target: pid}, status) when is_pid(pid) do
+    TeslaMate.FleetTelemetry.StreamProvider.mark_connection(pid, status)
+  end
+
+  defp notify(_state, _status), do: :ok
 
   @impl true
   def handle_message(topic_levels, payload, state) do

@@ -57,6 +57,34 @@ defmodule TeslaMate.FleetTelemetry.StreamProvider do
     GenServer.cast(server, {:ingest, field, value})
   end
 
+  @doc "Verbindungswechsel vom MQTT-Handler melden (:up | :down | :terminating)."
+  def mark_connection(server, status) when status in [:up, :down, :terminating] do
+    GenServer.cast(server, {:connection, status})
+  end
+
+  @doc """
+  Ist die MQTT-Verbindung dieses Providers offen?
+
+  ⚠️ Bewusst konservativ: alles ausser einem klaren `true` heisst `false` - kein Prozess,
+  tot, nie verbunden oder nicht antwortend. Der Aufrufer (Parkdrosselung in vehicle.ex)
+  darf dann nicht drosseln, weil ihn niemand wecken wuerde.
+
+  Der Timeout ist kurz und der Exit gefangen: ein haengender Provider darf den
+  Vehicle-FSM weder blockieren noch mitreissen. Das ist der Unterschied zu
+  `Process.alive?/1`, das bei einem lebenden, aber verbindungslosen Provider `true`
+  sagt - genau die Luecke, gegen die diese Funktion gebaut ist (der Provider ueberlebt
+  einen Stall absichtlich, siehe @moduledoc).
+  """
+  def connected?(server, timeout \\ 200)
+
+  def connected?(pid, timeout) when is_pid(pid) do
+    GenServer.call(pid, :connected?, timeout) == true
+  catch
+    :exit, _ -> false
+  end
+
+  def connected?(_server, _timeout), do: false
+
   def stop(pid) do
     if Process.alive?(pid), do: GenServer.stop(pid, :normal), else: :ok
     :ok
@@ -97,7 +125,10 @@ defmodule TeslaMate.FleetTelemetry.StreamProvider do
       started_at: DateTime.utc_now(),
       streaming?: false,
       timer: nil,
-      client_id: nil
+      client_id: nil,
+      # Erst ein ausdrueckliches :up des Handlers schaltet das auf true. Vor der ersten
+      # Meldung gilt die Verbindung als geschlossen - die sichere Richtung.
+      connected?: false
     }
 
     st =
@@ -111,6 +142,10 @@ defmodule TeslaMate.FleetTelemetry.StreamProvider do
   end
 
   @impl true
+  def handle_cast({:connection, status}, st) do
+    {:noreply, %{st | connected?: status == :up}}
+  end
+
   def handle_cast({:ingest, field, value}, st) do
     now = DateTime.utc_now()
     fs = FieldState.put(st.state, field, value, now)
@@ -162,6 +197,9 @@ defmodule TeslaMate.FleetTelemetry.StreamProvider do
 
     {:noreply, st}
   end
+
+  @impl true
+  def handle_call(:connected?, _from, st), do: {:reply, st.connected?, st}
 
   @impl true
   def handle_info(:stall, st) do
@@ -268,7 +306,7 @@ defmodule TeslaMate.FleetTelemetry.StreamProvider do
     Tortoise311.Connection.start_link(
       client_id: client_id,
       server: {Transport.Tcp, host: host, port: port},
-      handler: {Handler, [target: me]},
+      handler: {Handler, [target: me, status_target: me]},
       subscriptions: [{"#{topic_base}/#{vin}/v/#", 0}]
     )
   end

@@ -2,8 +2,13 @@ defmodule TeslaMate.Vehicles.Vehicle.ParkedThrottleTest do
   # Pure Unit-Tests fuer die Poll-Drosselung des wachen, parkenden Autos. Eigene Datei
   # (statt VehicleCase) wie charge_throttle_test.exs, damit die FLEET_TELEMETRY_*-Env-
   # Manipulation nicht in die Integrationstests blutet.
+  #
+  # ⚠️ Die Abdeckung wird mit ECHTEN StreamProvider-Prozessen geprueft, nicht mit self():
+  # fleet_parked_covered?/1 fragt den Provider per GenServer.call nach seinem
+  # Verbindungsstatus - mit self() als Pid wuerde der Test sich selbst anrufen.
   use ExUnit.Case, async: false
 
+  alias TeslaMate.FleetTelemetry.StreamProvider
   alias TeslaMate.Vehicles.Vehicle
   alias TeslaMate.Vehicles.Vehicle.Data
   alias TeslaMate.Log.Car
@@ -23,11 +28,30 @@ defmodule TeslaMate.Vehicles.Vehicle.ParkedThrottleTest do
     :ok
   end
 
+  defp provider(connected?) do
+    {:ok, pid} =
+      StreamProvider.start_link(
+        car_id: 1,
+        vin: "PARKVIN",
+        receiver: fn _ -> :ok end,
+        connect?: false
+      )
+
+    on_exit(fn -> StreamProvider.stop(pid) end)
+
+    if connected? do
+      StreamProvider.mark_connection(pid, :up)
+      assert StreamProvider.connected?(pid)
+    end
+
+    pid
+  end
+
   defp covered_data do
     %Data{
       car: %Car{vin: "PARKVIN"},
-      stream_pid: self(),
-      charge_watch_pid: self()
+      stream_pid: provider(true),
+      charge_watch_pid: provider(true)
     }
   end
 
@@ -39,7 +63,7 @@ defmodule TeslaMate.Vehicles.Vehicle.ParkedThrottleTest do
   end
 
   describe "parked_poll_interval/2 - gedrosselt, wenn uns jemand wecken wuerde" do
-    test "beide Dauer-Abonnenten leben: Default 300 s" do
+    test "beide Dauer-Abonnenten leben und sind verbunden: Default 300 s" do
       assert Vehicle.parked_poll_interval(covered_data(), 15) == 300
     end
 
@@ -102,6 +126,37 @@ defmodule TeslaMate.Vehicles.Vehicle.ParkedThrottleTest do
     test "toter Ladewaechter" do
       data = %{covered_data() | charge_watch_pid: dead_pid()}
       assert Vehicle.parked_poll_interval(data, 15) == 15
+    end
+  end
+
+  describe "parked_poll_interval/2 - lebendig ist nicht verbunden" do
+    # Der StreamProvider ueberlebt einen Stall absichtlich: bricht die MQTT-Strecke weg,
+    # lebt der Prozess weiter und Process.alive?/1 meldet weiter true. Genau dann wuerde
+    # uns aber niemand mehr wecken - also darf auch nicht gedrosselt werden.
+    test "Fahr-Provider lebt, ist aber nicht verbunden" do
+      data = %{covered_data() | stream_pid: provider(false)}
+      assert Vehicle.parked_poll_interval(data, 15) == 15
+    end
+
+    test "Ladewaechter lebt, ist aber nicht verbunden" do
+      data = %{covered_data() | charge_watch_pid: provider(false)}
+      assert Vehicle.parked_poll_interval(data, 15) == 15
+    end
+
+    test "Verbindung faellt weg -> Drosselung endet sofort" do
+      data = covered_data()
+      assert Vehicle.parked_poll_interval(data, 15) == 300
+
+      StreamProvider.mark_connection(data.stream_pid, :down)
+      assert Vehicle.parked_poll_interval(data, 15) == 15
+    end
+
+    test "Verbindung kommt zurueck -> Drosselung greift wieder" do
+      data = %{covered_data() | stream_pid: provider(false)}
+      assert Vehicle.parked_poll_interval(data, 15) == 15
+
+      StreamProvider.mark_connection(data.stream_pid, :up)
+      assert Vehicle.parked_poll_interval(data, 15) == 300
     end
   end
 
