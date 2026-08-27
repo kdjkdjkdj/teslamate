@@ -79,6 +79,34 @@ defmodule TeslaMate.FleetTelemetry.ChargeBackfillTest do
     assert Repo.aggregate(BackfillMarker, :count) == 0
   end
 
+  # Regression: `s.date >= since` schnitt eine Session, die die Fenstergrenze
+  # kreuzt, vorn ab. Ohne echten Vorgang greift der Ueberlappungsschutz nicht --
+  # nachgetragen wurde dann ein VERKUERZTER Vorgang, dessen Start ausserdem mit
+  # dem Fenster wandert (und damit den Marker-Vergleich entwertet).
+  test "scan traegt eine Session, die vor dem Fenster begann, nicht verkuerzt nach" do
+    {:ok, car} = Log.create_car(%{eid: 44, vid: 44, vin: "TESTVIN0000000044"})
+    edge = DateTime.add(DateTime.utc_now(), -7 * 86_400)
+
+    # Session beginnt 10 min VOR der Fenstergrenze und laeuft hinein.
+    # Kein charging_process -- es gibt also nichts, was sie sonst schuetzen wuerde.
+    insert_shadow(car.id, DateTime.add(edge, -10 * 60), 27, "0.0")
+    insert_shadow(car.id, DateTime.add(edge, -2 * 60), 40, "9.0")
+    insert_shadow(car.id, DateTime.add(edge, 8 * 60), 52, "18.0")
+    insert_shadow(car.id, DateTime.add(edge, 20 * 60), 63, "25.0")
+
+    Repo.insert!(%Position{
+      car_id: car.id,
+      date: DateTime.add(edge, 25 * 60),
+      latitude: 0.0,
+      longitude: 0.0
+    })
+
+    assert :ok = ChargeBackfill.scan(car.id, test_deps())
+
+    assert Repo.aggregate(from(c in ChargingProcess, where: c.car_id == ^car.id), :count) == 0
+    assert Repo.aggregate(BackfillMarker, :count) == 0
+  end
+
   defp insert_shadow(car_id, date, bl, kwh) do
     %ShadowCharge{}
     |> ShadowCharge.changeset(%{

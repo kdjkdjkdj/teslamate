@@ -16,6 +16,7 @@ defmodule TeslaMate.FleetTelemetry.ChargeBackfill do
   alias TeslaMate.Log.{Car, ChargingProcess, Position}
 
   @window_days 7
+  @lookback_hours 24
 
   def start_link(opts), do: GenServer.start_link(__MODULE__, opts, name: __MODULE__)
 
@@ -43,10 +44,19 @@ defmodule TeslaMate.FleetTelemetry.ChargeBackfill do
   def scan(car_id, deps \\ deps()) do
     since = DateTime.add(DateTime.utc_now(), -@window_days * 86_400, :second)
 
+    # Vorlauf, damit eine Session, die die Fenstergrenze kreuzt, VOLLSTAENDIG
+    # geladen wird. Ohne ihn schneidet `s.date >= since` sie vorn ab: ihr
+    # Startzeitpunkt wandert dann mit dem Fenster, was den Marker-Vergleich auf
+    # {session_start, session_end} entwertet und -- fehlt ein echter Vorgang,
+    # gegen den der Ueberlappungsschutz greifen koennte -- einen verkuerzten
+    # Vorgang nachtraegt. Die Sessions selbst bleiben auf das Fenster begrenzt
+    # (Filter unten); der Vorlauf dient nur der vollstaendigen Sicht.
+    lookback = DateTime.add(since, -@lookback_hours * 3600, :second)
+
     rows =
       Repo.all(
         from s in ShadowCharge,
-          where: s.car_id == ^car_id and s.date >= ^since,
+          where: s.car_id == ^car_id and s.date >= ^lookback,
           order_by: s.date
       )
 
@@ -75,6 +85,7 @@ defmodule TeslaMate.FleetTelemetry.ChargeBackfill do
 
     rows
     |> Detector.cluster_sessions(now: DateTime.utc_now())
+    |> Enum.reject(fn s -> DateTime.compare(s.start, since) == :lt end)
     |> Enum.reject(&Detector.overlaps?(&1, cprocs))
     |> Enum.filter(&Detector.charging_session?/1)
     |> Enum.filter(&Detector.significant?/1)
