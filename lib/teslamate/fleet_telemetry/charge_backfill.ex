@@ -50,10 +50,16 @@ defmodule TeslaMate.FleetTelemetry.ChargeBackfill do
           order_by: s.date
       )
 
+    # Fenstergrenze am ENDE pruefen, nicht am Start: ein per Poll erfasster
+    # Vorgang, der vor `since` begann und in das Fenster hineinreicht, muss in
+    # der Vergleichsliste stehen. Sonst faellt er heraus, waehrend die (spaeter
+    # beginnende) Shadow-Session noch drin ist -- und der Ueberlappungs-Filter
+    # laeuft ins Leere. Genau so entstanden am 04./05./13./20.08.2026 fuenf
+    # doppelt angelegte Ladevorgaenge, jeweils exakt 7 Tage nach der Ladung.
     cprocs =
       Repo.all(
         from c in ChargingProcess,
-          where: c.car_id == ^car_id and c.start_date >= ^since,
+          where: c.car_id == ^car_id and (is_nil(c.end_date) or c.end_date >= ^since),
           select: %{start_date: c.start_date, end_date: c.end_date}
       )
 

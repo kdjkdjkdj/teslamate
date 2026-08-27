@@ -23,8 +23,8 @@ defmodule TeslaMate.FleetTelemetry.ChargeBackfillTest do
     Repo.insert!(%Position{
       car_id: car.id,
       date: DateTime.add(now, -25 * 60),
-      latitude: 48.871983,
-      longitude: 9.346409
+      latitude: 0.0,
+      longitude: 0.0
     })
 
     deps = test_deps()
@@ -41,6 +41,42 @@ defmodule TeslaMate.FleetTelemetry.ChargeBackfillTest do
     assert :ok = ChargeBackfill.scan(car.id, deps)
     assert length(Repo.all(from c in ChargingProcess, where: c.car_id == ^car.id)) == 1
     assert Repo.aggregate(BackfillMarker, :count) == 1
+  end
+
+  # Regression: der Ueberlappungs-Filter verglich fruehen gegen dieselbe untere
+  # Fenstergrenze wie die Shadow-Zeilen. Ein Vorgang, der VOR `since` begann und
+  # in das Fenster hineinreicht, fehlte deshalb in der Vergleichsliste -- die
+  # spaeter beginnende Session galt als "nicht erfasst" und wurde ein zweites
+  # Mal angelegt (fuenf Faelle in Prod, jeweils exakt 7 Tage nach der Ladung).
+  test "scan ueberspringt eine Session, deren echter charging_process vor dem Fenster begann" do
+    {:ok, car} = Log.create_car(%{eid: 43, vid: 43, vin: "TESTVIN0000000043"})
+    edge = DateTime.add(DateTime.utc_now(), -7 * 86_400)
+
+    # Shadow-Session liegt knapp INNERHALB des 7-Tage-Fensters
+    insert_shadow(car.id, DateTime.add(edge, 2 * 60), 27, "0.0")
+    insert_shadow(car.id, DateTime.add(edge, 20 * 60), 45, "12.0")
+    insert_shadow(car.id, DateTime.add(edge, 40 * 60), 63, "25.0")
+
+    pos =
+      Repo.insert!(%Position{
+        car_id: car.id,
+        date: DateTime.add(edge, 45 * 60),
+        latitude: 0.0,
+        longitude: 0.0
+      })
+
+    # Der real per Poll erfasste Vorgang begann 3 min VOR der Fenstergrenze
+    Repo.insert!(%ChargingProcess{
+      car_id: car.id,
+      position_id: pos.id,
+      start_date: DateTime.add(edge, -3 * 60),
+      end_date: DateTime.add(edge, 45 * 60)
+    })
+
+    assert :ok = ChargeBackfill.scan(car.id, test_deps())
+
+    assert Repo.aggregate(from(c in ChargingProcess, where: c.car_id == ^car.id), :count) == 1
+    assert Repo.aggregate(BackfillMarker, :count) == 0
   end
 
   defp insert_shadow(car_id, date, bl, kwh) do
